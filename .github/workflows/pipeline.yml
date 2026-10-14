@@ -30,7 +30,8 @@ jobs:
           
         # Run the pipeline
         echo "=== Starting Data Pipeline Execution ==="
-        python $GITHUB_WORKSPACE/run_pipeline.py all
+        cd $GITHUB_WORKSPACE/labs
+        python run_pipeline.py all
 
         echo ""
         echo "=== All Pipelines Completed Successfully ==="

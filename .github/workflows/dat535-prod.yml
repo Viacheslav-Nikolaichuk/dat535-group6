@@ -40,7 +40,8 @@ jobs:
           
           LAB_TO_RUN="${{ github.event.inputs.lab || 'all' }}"
           echo "=== Running Production Pipeline ($LAB_TO_RUN) ==="
-          python $GITHUB_WORKSPACE/run_pipeline.py $LAB_TO_RUN
+          cd $GITHUB_WORKSPACE/labs
+          python run_pipeline.py $LAB_TO_RUN
 
       - name: Upload Production artifacts
         uses: actions/upload-artifact@v7
