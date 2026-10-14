@@ -1,0 +1,61 @@
+name: Daily Bronze Ingestion Pipeline
+
+on:
+  schedule:
+    # Runs daily at 02:00 UTC (after previous day hourly observations are fully settled)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: 'Target Date (YYYY-MM-DD) - leave blank for yesterday UTC'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry Run (test extraction without saving to disk)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  ingest-bronze:
+    name: Daily Bronze Ingestion
+    runs-on: self-hosted
+    env:
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          source ~/spark-env/bin/activate
+          pip install -r requirements.txt
+
+      - name: Run Daily Bronze Ingestion
+        run: |
+          source ~/spark-env/bin/activate
+          mkdir -p "$DAT535_DATA_DIR/bronze"
+          
+          EXTRA_ARGS=""
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --date ${{ github.event.inputs.target_date }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --dry-run"
+          fi
+          
+          echo "=== Executing Daily Bronze Ingestion ==="
+          python src/ingestion/ingest_daily.py $EXTRA_ARGS
+
+      - name: Write GitHub Step Summary
+        run: |
+          echo "## Daily Bronze Ingestion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Run Number | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target Date | ${{ github.event.inputs.target_date || 'Yesterday UTC (default)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | ${{ github.event.inputs.dry_run || 'false' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bronze Directory | $DAT535_DATA_DIR/bronze |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered By | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

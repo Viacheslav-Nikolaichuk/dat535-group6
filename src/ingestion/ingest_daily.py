@@ -135,12 +135,12 @@ def run_daily_ingestion(
                     overwrite=True,
                 )
                 metrics["electricity_files"] += 1
-                logger.info(f"✓ [{zone}] Ingested {len(records)} hourly prices -> {saved_path}")
+                logger.info(f"[OK] [{zone}] Ingested {len(records)} hourly prices -> {saved_path}")
             else:
-                logger.info(f"✓ [DRY RUN] [{zone}] Extracted {len(records)} hourly prices")
+                logger.info(f"[OK] [DRY RUN] [{zone}] Extracted {len(records)} hourly prices")
         except Exception as e:
             err_msg = f"Failed to ingest electricity prices for {zone}: {e}"
-            logger.error(f"✗ {err_msg}")
+            logger.error(f"[FAIL] {err_msg}")
             metrics["errors"].append(err_msg)
 
     # 2. Ingest Meteorological Observations
@@ -171,12 +171,12 @@ def run_daily_ingestion(
                     overwrite=True,
                 )
                 metrics["weather_files"] += 1
-                logger.info(f"✓ [{station_id}] Ingested {len(records)} observations -> {saved_path}")
+                logger.info(f"[OK] [{station_id}] Ingested {len(records)} observations -> {saved_path}")
             else:
-                logger.info(f"✓ [DRY RUN] [{station_id}] Extracted {len(records)} observations")
+                logger.info(f"[OK] [DRY RUN] [{station_id}] Extracted {len(records)} observations")
         except Exception as e:
             err_msg = f"Failed to ingest weather observations for station {station_id}: {e}"
-            logger.error(f"✗ {err_msg}")
+            logger.error(f"[FAIL] {err_msg}")
             metrics["errors"].append(err_msg)
 
     elapsed = time.time() - start_time
