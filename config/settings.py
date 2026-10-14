@@ -1,0 +1,80 @@
+"""
+Project configuration and environment settings for DAT535.
+Loads environment variables from .env if present and sets canonical
+paths for Bronze, Silver, and Gold storage tiers.
+"""
+
+import os
+from pathlib import Path
+
+
+def _load_env_file(project_root: Path) -> None:
+    """Manually parse .env file to support key=val or key:val formats."""
+    env_file = project_root / ".env"
+    if not env_file.exists():
+        return
+
+    try:
+        content = env_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        content = env_file.read_text(encoding="latin-1")
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        separator = "=" if "=" in line else (":" if ":" in line else None)
+        if separator:
+            key, val = line.split(separator, 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            # Set in os.environ if not already defined
+            if key not in os.environ:
+                os.environ[key] = val
+            # Also normalize uppercase variants
+            upper_key = key.upper()
+            if upper_key not in os.environ:
+                os.environ[upper_key] = val
+
+
+# Project root path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Load local .env if available
+_load_env_file(PROJECT_ROOT)
+
+# Medallion data directory
+DEFAULT_DATA_DIR = os.environ.get(
+    "DAT535_DATA_DIR",
+    str(Path.home() / "spark-project-data") if os.name != "nt" else str(PROJECT_ROOT / "data")
+)
+DATA_DIR = Path(DEFAULT_DATA_DIR)
+BRONZE_DIR = DATA_DIR / "bronze"
+SILVER_DIR = DATA_DIR / "silver"
+GOLD_DIR = DATA_DIR / "gold"
+
+# MET Norway Frost API Configuration
+FROST_BASE_URL = os.environ.get("FROST_BASE_URL", "https://frost.met.no")
+FROST_CLIENT_ID = (
+    os.environ.get("FROST_CLIENT_ID")
+    or os.environ.get("CLIENT_ID")
+    or os.environ.get("client_id", "")
+)
+FROST_CLIENT_SECRET = (
+    os.environ.get("FROST_CLIENT_SECRET")
+    or os.environ.get("CLIENT_SECRET")
+    or os.environ.get("client_secret", "")
+)
+
+# Strømpris API Configuration (Hva Koster Strømmen)
+STROMPRIS_BASE_URL = os.environ.get(
+    "STROMPRIS_BASE_URL",
+    "https://www.hvakosterstrommen.no/api/v1/prices"
+)
+
+# Norwegian Electricity Bidding Zones
+PRICE_ZONES = ["NO1", "NO2", "NO3", "NO4", "NO5"]
+
+# Config File Paths
+ZONES_CONFIG_FILE = PROJECT_ROOT / "config" / "zones_and_stations.json"

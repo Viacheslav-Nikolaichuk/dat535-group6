@@ -1,0 +1,76 @@
+{
+  "zones": {
+    "NO1": {
+      "name": "Oslo / Øst-Norge",
+      "primary_station": "SN18700",
+      "stations": [
+        {
+          "id": "SN18700",
+          "name": "Oslo - Blindern",
+          "lat": 59.9423,
+          "lon": 10.7200,
+          "municipality": "Oslo"
+        }
+      ]
+    },
+    "NO2": {
+      "name": "Kristiansand / Sør-Norge",
+      "primary_station": "SN39040",
+      "stations": [
+        {
+          "id": "SN39040",
+          "name": "Kjevik",
+          "lat": 58.2000,
+          "lon": 8.0833,
+          "municipality": "Kristiansand"
+        },
+        {
+          "id": "SN44560",
+          "name": "Sola",
+          "lat": 58.8833,
+          "lon": 5.6333,
+          "municipality": "Sola"
+        }
+      ]
+    },
+    "NO3": {
+      "name": "Trondheim / Midt-Norge",
+      "primary_station": "SN68860",
+      "stations": [
+        {
+          "id": "SN68860",
+          "name": "Trondheim - Voll",
+          "lat": 63.4107,
+          "lon": 10.4538,
+          "municipality": "Trondheim"
+        }
+      ]
+    },
+    "NO4": {
+      "name": "Tromsø / Nord-Norge",
+      "primary_station": "SN90450",
+      "stations": [
+        {
+          "id": "SN90450",
+          "name": "Tromsø - Vervarslinga",
+          "lat": 69.6537,
+          "lon": 18.9388,
+          "municipality": "Tromsø"
+        }
+      ]
+    },
+    "NO5": {
+      "name": "Bergen / Vest-Norge",
+      "primary_station": "SN50540",
+      "stations": [
+        {
+          "id": "SN50540",
+          "name": "Bergen - Florida",
+          "lat": 60.3830,
+          "lon": 5.3327,
+          "municipality": "Bergen"
+        }
+      ]
+    }
+  }
+}
