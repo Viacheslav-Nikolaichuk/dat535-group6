@@ -1,0 +1,15 @@
+# Environment & credentials
+/.env
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Testing & notebooks
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Local data directories
+/data/
