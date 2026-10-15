@@ -10,6 +10,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 .
 ├── .github/
 │   └── workflows/
+│       ├── ci.yml                         # Unit tests on GitHub-hosted runners (push to dev, PRs to dev/main)
 │       └── daily_bronze_ingestion.yml     # Automated daily batch ingestion on runner (cron 02:00 UTC)
 ├── config/
 │   ├── settings.py                        # Path resolutions, env loader, and API base settings
@@ -115,6 +116,8 @@ Execute the automated test suite:
 ```bash
 pytest tests/test_ingestion.py -v
 ```
+
+The same suite runs automatically in `.github/workflows/ci.yml` on every push to `dev` and every pull request to `dev`/`main`. It uses GitHub-hosted runners, so the self-hosted VM runner is used only for jobs that touch real data.
 
 ---
 
