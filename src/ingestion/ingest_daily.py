@@ -163,13 +163,21 @@ def _new_metrics(batch_id: str, dates: List[str]) -> Dict:
         "weather_records": 0,
         "files": {STATUS_CREATED: 0, STATUS_NEW_VERSION: 0, STATUS_UNCHANGED: 0},
         "synthetic_files": 0,
+        "written_files": [],
         "empty_payloads": [],
         "errors": [],
     }
 
 
-def _record_write(metrics: Dict, result, label: str, n_records: int) -> None:
+def _record_write(metrics: Dict, result, label: str, n_records: int, bronze_dir: Path) -> None:
     metrics["files"][result.status] += 1
+    if result.written:
+        # Paths relative to the Bronze root let Silver process only this run's new files.
+        metrics["written_files"].append({
+            "path": result.path.relative_to(bronze_dir).as_posix(),
+            "status": result.status,
+            "records": n_records,
+        })
     logger.info(f"[OK] {label} {n_records} records -> {result.status}: {result.path.name}")
 
 
@@ -246,7 +254,7 @@ def run_ingestion(
                         source_uri=res["source_uri"],
                         batch_id=batch_id,
                     )
-                    _record_write(metrics, result, f"[{zone}]", len(records))
+                    _record_write(metrics, result, f"[{zone}]", len(records), writer.bronze_dir)
             except Exception as e:
                 err_msg = f"electricity {zone} {date_str}: {e}"
                 logger.error(f"[FAIL] {err_msg}")
@@ -283,7 +291,7 @@ def run_ingestion(
                     )
                     if is_synthetic and result.written:
                         metrics["synthetic_files"] += 1
-                    _record_write(metrics, result, f"[{station_id}]", len(records))
+                    _record_write(metrics, result, f"[{station_id}]", len(records), writer.bronze_dir)
             except Exception as e:
                 err_msg = f"weather {station_id} {date_str}: {e}"
                 logger.error(f"[FAIL] {err_msg}")
@@ -333,6 +341,7 @@ def run_ingestion(
             "weather_records": metrics["weather_records"],
             "files": files,
             "synthetic_files": metrics["synthetic_files"],
+            "written_files": metrics["written_files"],
             "empty_payloads": metrics["empty_payloads"],
             "errors": metrics["errors"],
         }

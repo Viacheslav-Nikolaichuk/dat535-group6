@@ -332,7 +332,20 @@ def test_run_ingestion_mock_opt_in_writes_flagged_files_and_is_rerunnable(tmp_pa
     data_files_after = len(list((tmp_path / "weather").rglob("*.json"))) + len(list((tmp_path / "electricity").rglob("*.json")))
     assert data_files_after == data_files_before
     # But a second run manifest is recorded in _manifests
-    assert len(list((tmp_path / "_manifests").glob("run__*.json"))) == 2
+    manifest_paths = list((tmp_path / "_manifests").glob("run__*.json"))
+    assert len(manifest_paths) == 2
+
+    # Each manifest lists exactly the files that run wrote: 4 on the first run, none on the rerun.
+    written = sorted(
+        (json.loads(p.read_text(encoding="utf-8"))["written_files"] for p in manifest_paths),
+        key=len,
+    )
+    assert written[0] == []
+    assert len(written[1]) == 4
+    for entry in written[1]:
+        assert (tmp_path / entry["path"]).is_file()
+        assert entry["status"] == STATUS_CREATED
+    assert {e["path"].split("/")[0] for e in written[1]} == {"electricity", "weather"}
 
 
 # ---------------------------------------------------------------------- #
