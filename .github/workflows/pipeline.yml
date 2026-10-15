@@ -1,4 +1,8 @@
-name: Daily Bronze Ingestion Pipeline
+name: Data Pipeline
+
+# Production medallion pipeline on the self-hosted runner. Each layer is a job;
+# Silver and Gold will be added as jobs with `needs:` on the previous layer so they
+# only run after it succeeds and can be re-run individually.
 
 on:
   schedule:
@@ -30,13 +34,13 @@ on:
         default: false
         type: boolean
 
-# Never let two ingestion runs write to Bronze at the same time.
+# Never let two pipeline runs write to the data directory at the same time.
 concurrency:
-  group: bronze-ingestion
+  group: data-pipeline
   cancel-in-progress: false
 
 jobs:
-  ingest-bronze:
+  bronze:
     name: Bronze Ingestion
     runs-on: self-hosted
     timeout-minutes: 120

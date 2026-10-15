@@ -11,7 +11,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                         # Unit tests on GitHub-hosted runners (push to dev, PRs to dev/main)
-│       └── daily_bronze_ingestion.yml     # Automated daily batch ingestion on runner (cron 02:00 UTC)
+│       └── pipeline.yml                   # Daily medallion pipeline on the VM runner (cron 02:00 UTC; Bronze for now)
 ├── config/
 │   ├── settings.py                        # Path resolutions, env loader, and API base settings
 │   └── zones_and_stations.json            # Mapping of bidding zones NO1-NO5 to MET Norway weather stations
@@ -144,11 +144,12 @@ python src/ingestion/ingest_daily.py --date 2024-01-15 --dry-run
 
 ### Running on the VM Runner via GitHub Actions
 
-The workflow `.github/workflows/daily_bronze_ingestion.yml` runs automatically on the self-hosted runner:
-1. **Schedule**: Daily at `02:00 UTC` (cron `0 2 * * *`), automatically running a 3-day lookback catch-up.
+The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It currently has one job (`bronze`); Silver and Gold will be added as dependent jobs in the same workflow.
+
+1. **Schedule**: Daily at `02:00 UTC` (cron `0 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main`.
 2. **Quality Gate**: Runs the unit test suite (`pytest -q`) automatically prior to executing ingestion.
-3. **Concurrency & Safety**: Protected by GitHub Actions concurrency locks (`bronze-ingestion`) and strict regex parameter sanitization to prevent race conditions or shell injection.
-4. **Manual Dispatch**: Go to **Actions** -> **Daily Bronze Ingestion Pipeline** -> **Run workflow**:
+3. **Concurrency & Safety**: Protected by a GitHub Actions concurrency lock (`data-pipeline`) and strict regex parameter sanitization to prevent race conditions or shell injection.
+4. **Manual Dispatch**: Go to **Actions** -> **Data Pipeline** -> **Run workflow**:
    - Provide a `target_date` for a single day rerun.
    - Or provide `start_date` and `end_date` for bulk historical backfills.
    - Or adjust `lookback_days` (defaults to 3).
