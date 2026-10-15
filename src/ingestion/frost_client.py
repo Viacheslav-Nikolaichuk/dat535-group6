@@ -32,6 +32,7 @@ class FrostClient:
         date_str: str,
         station_id: str,
         elements: Optional[List[str]] = None,
+        time_resolutions: Optional[List[str]] = None,
         timeout: int = 25,
         allow_mock_fallback: bool = False,
     ) -> Dict[str, Any]:
@@ -42,6 +43,9 @@ class FrostClient:
             date_str: Date formatted as 'YYYY-MM-DD'.
             station_id: MET station identifier (e.g. 'SN18700').
             elements: List of weather elements (default: ['air_temperature', 'wind_speed']).
+            time_resolutions: ISO-8601 series resolutions to request (default: ['PT1H']).
+                Without this filter Frost also returns 1-minute and 10-minute series for some
+                stations (~2 MB/day instead of ~25 KB), which Silver would discard anyway.
             timeout: Request timeout in seconds.
             allow_mock_fallback: If True and client_id is missing, returns synthetic records
                 flagged with is_synthetic=True. Must be explicitly opted into by the caller;
@@ -52,6 +56,8 @@ class FrostClient:
         """
         if elements is None:
             elements = ["air_temperature", "wind_speed"]
+        if time_resolutions is None:
+            time_resolutions = ["PT1H"]
 
         if not self.client_id:
             msg = (
@@ -74,6 +80,7 @@ class FrostClient:
             "sources": station_id,
             "referencetime": referencetime,
             "elements": ",".join(elements),
+            "timeresolutions": ",".join(time_resolutions),
         }
 
         logger.info(

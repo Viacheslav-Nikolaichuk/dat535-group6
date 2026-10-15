@@ -60,7 +60,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 
 ### 2. Meteorological Observations (MET Norway Frost API)
 * **Provider**: `frost.met.no`
-* **Format**: Hourly surface observations (`air_temperature`, `wind_speed`) from official meteorological stations.
+* **Format**: Hourly surface observations (`air_temperature`, `wind_speed`) from official meteorological stations. Requests use `timeresolutions=PT1H`; without it some stations also return 1-minute and 10-minute series (~2 MB/day instead of ~25 KB).
 * **Authentication**: Free instant registration requiring a `Client ID` from [Frost Credentials](https://frost.met.no/auth/requestCredentials.html).
 * **Nature of Data**: Empirical physical sensor observations (available up to the current hour; not predictive forecasts).
 

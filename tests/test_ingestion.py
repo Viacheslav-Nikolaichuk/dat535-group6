@@ -94,6 +94,37 @@ def test_frost_client_without_credentials_refuses_by_default():
         client.fetch_observations(date_str="2024-01-15", station_id="SN18700")
 
 
+class _FakeResponse:
+    status_code = 200
+    url = "https://frost.met.no/observations/v0.jsonld?fake"
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"data": [{"sourceId": "SN18700:0", "observations": []}]}
+
+
+class _CapturingSession:
+    def __init__(self):
+        self.params = None
+
+    def get(self, url, params=None, **kwargs):
+        self.params = params
+        return _FakeResponse()
+
+
+def test_frost_client_requests_hourly_series_only_by_default():
+    """Without a resolution filter Frost also returns 1-min/10-min series (~100x larger payloads)."""
+    session = _CapturingSession()
+    client = FrostClient(client_id="abc", session=session)
+    res = client.fetch_observations(date_str="2024-01-15", station_id="SN18700")
+
+    assert session.params["timeresolutions"] == "PT1H"
+    assert session.params["referencetime"] == "2024-01-15/2024-01-16"
+    assert res["record_count"] == 1
+
+
 def test_bronze_writer_envelope_and_persistence(tmp_path: Path):
     """Verify writing and reading Bronze envelope with partition hierarchy."""
     writer = BronzeWriter(bronze_dir=tmp_path)

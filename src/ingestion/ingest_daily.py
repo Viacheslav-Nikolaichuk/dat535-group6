@@ -51,6 +51,7 @@ logging.basicConfig(
 logger = logging.getLogger("ingest_daily")
 
 WEATHER_ELEMENTS = ["air_temperature", "wind_speed"]
+WEATHER_TIME_RESOLUTIONS = ["PT1H"]
 
 EXIT_OK = 0
 EXIT_PARTIAL_FAILURE = 1
@@ -259,6 +260,7 @@ def run_ingestion(
                     date_str=date_str,
                     station_id=station_id,
                     elements=WEATHER_ELEMENTS,
+                    time_resolutions=WEATHER_TIME_RESOLUTIONS,
                     allow_mock_fallback=allow_mock_weather,
                 )
                 records = res["records"]
