@@ -10,10 +10,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 .
 ├── .github/
 │   └── workflows/
-│       ├── daily_bronze_ingestion.yml     # Automated daily batch ingestion on runner (cron 02:00 UTC)
-│       ├── dat535-dev.yml                 # Dev branch CI/CD pipeline for lab exercises
-│       ├── dat535-prod.yml                # Main branch production deployment for lab exercises
-│       └── pipeline.yml                   # Lab scheduled & manual dispatch workflow
+│       └── daily_bronze_ingestion.yml     # Automated daily batch ingestion on runner (cron 02:00 UTC)
 ├── config/
 │   ├── settings.py                        # Path resolutions, env loader, and API base settings
 │   └── zones_and_stations.json            # Mapping of bidding zones NO1-NO5 to MET Norway weather stations
@@ -39,7 +36,8 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   ├── lab3_advanced_spark.ipynb
 │   ├── lab3_pipeline.py
 │   ├── run_pipeline.py
-│   └── project_cicd_guide.md
+│   ├── project_cicd_guide.md
+│   └── workflows/                         # Disabled lab workflows (dat535-dev, dat535-prod, pipeline)
 ├── docs/                                  # Project guides & documentation
 │   └── Data_Engineering_Project_Definition_Guide_v3.pdf
 ├── dat535_data_engineering_project_definition.md # Official project specification & architecture
@@ -165,3 +163,5 @@ The previous lab exercises and notebooks have been moved to the `labs/` director
 cd labs
 python run_pipeline.py all
 ```
+
+The lab GitHub Actions workflows are kept in `labs/workflows/` for reference only. GitHub runs workflows only from `.github/workflows/`, so they no longer trigger on push, PR, or schedule and don't occupy the self-hosted runner.
