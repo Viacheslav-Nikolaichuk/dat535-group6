@@ -142,7 +142,17 @@ class BronzeWriter:
     # Write path
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _atomic_write_json(target_file: Path, data: Dict[str, Any]) -> Path:
+    def _replace_json(target_file: Path, data: Dict[str, Any]) -> None:
+        """Write JSON via a temp file + rename so readers never see a partial file."""
+        # Leading dot: Spark/Hadoop skip hidden files, so a temp file left behind by a
+        # crash is never picked up as a (corrupt) Bronze record by directory reads.
+        tmp_file = target_file.with_name(f".{target_file.name}.tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp_file.replace(target_file)
+
+    @classmethod
+    def _atomic_write_json(cls, target_file: Path, data: Dict[str, Any]) -> Path:
         """Write JSON data to disk atomically to prevent partial reads. Never overwrites."""
         target_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -153,10 +163,7 @@ class BronzeWriter:
             final = target_file.with_name(f"{target_file.stem}_{n}{target_file.suffix}")
             n += 1
 
-        tmp_file = final.with_name(final.name + ".tmp")
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp_file.replace(final)
+        cls._replace_json(final, data)
         return final
 
     def _write_versioned(
@@ -279,10 +286,7 @@ class BronzeWriter:
         batch_id = manifest.get("batch_id") or generate_batch_id()
         target_file = manifest_dir / f"run__{batch_id}.json"
 
-        tmp_file = target_file.with_name(target_file.name + ".tmp")
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-        tmp_file.replace(target_file)
+        self._replace_json(target_file, manifest)
         logger.info(f"Persisted ingestion run manifest to {target_file}")
         return target_file
 

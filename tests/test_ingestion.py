@@ -220,6 +220,23 @@ def test_bronze_writer_flags_synthetic_payloads(tmp_path: Path):
     assert writer.read_bronze_file(result.path)["_metadata"]["_is_synthetic"] is True
 
 
+def test_bronze_writer_leaves_only_hidden_temp_files_on_crash(tmp_path: Path, monkeypatch):
+    """A crash mid-write must not leave a file that Spark would read as Bronze data."""
+    writer = BronzeWriter(bronze_dir=tmp_path)
+
+    def failing_dump(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(json, "dump", failing_dump)
+    with pytest.raises(OSError):
+        writer.write_electricity_prices("NO1", "2024-01-15", SAMPLE_PRICES, "u", "b")
+
+    leftovers = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert leftovers  # the partial temp file is still there...
+    assert all(p.name.startswith(".") for p in leftovers)  # ...but hidden from Spark
+    assert writer.list_versions("electricity", "NO1", "2024-01-15") == []
+
+
 def test_load_stations_config():
     """Verify that all bidding zones NO1-NO5 have mapped weather stations."""
     mapping = load_stations_config()
