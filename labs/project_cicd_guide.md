@@ -1,5 +1,8 @@
 # Project — CI/CD Pipelines: Dev/Prod with GitHub Actions
 
+> **Archived:** the lab workflows referenced below now live in [workflows/](workflows/) and are
+> disabled (GitHub only runs workflows from `.github/workflows/`). Copy one back there to re-enable it.
+
 ## Learning Objectives
 
 - Understand Dev/Prod environment separation
@@ -33,9 +36,9 @@ workflows per branch and "Environments" that can require human approval before a
 ## The Dev/Prod Model
 
 1. Work on `dev` branch locally or on the cluster
-2. Push to `dev` — [.github/workflows/dat535-dev.yml](.github/workflows/dat535-dev.yml) runs automatically on the self-hosted runner
+2. Push to `dev` — [dat535-dev.yml](workflows/dat535-dev.yml) runs automatically on the self-hosted runner
 3. Open a Pull Request from `dev` to `main` to release
-4. After merge, [.github/workflows/dat535-prod.yml](.github/workflows/dat535-prod.yml) runs on the `main` environment and requires manual deployment approval
+4. After merge, [dat535-prod.yml](workflows/dat535-prod.yml) runs on the `main` environment and requires manual deployment approval
 
 ---
 

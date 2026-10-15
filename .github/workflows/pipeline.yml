@@ -1,36 +1,112 @@
-name: Pipeline
+name: Data Pipeline
+
+# Production medallion pipeline on the self-hosted runner. Each layer is a job;
+# Silver and Gold will be added as jobs with `needs:` on the previous layer so they
+# only run after it succeeds and can be re-run individually.
 
 on:
-  workflow_dispatch:
-  #push:
-  #  branches: [ main ]
   schedule:
-    # Alternative intervals (uncomment one and comment out the active line below):
-    #- cron: "0 0 * * *"    # every day at midnight UTC
-    #- cron: '0 * * * *'    # every hour
-    #- cron: '0 */6 * * *'  # every 6 hours
-    - cron: '0 0 1 * *'     # active: monthly, 1st of month at 00:00 UTC
+    # Runs daily at 02:00 UTC (after previous day hourly observations are fully settled).
+    # Scheduled runs re-check the last 3 days: missed runs are filled in and MET Norway
+    # QC revisions become new Bronze versions; unchanged days are skipped via checksum.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: 'Single date (YYYY-MM-DD). Leave all date fields blank for the default lookback.'
+        required: false
+        default: ''
+      start_date:
+        description: 'Backfill start date (YYYY-MM-DD, inclusive)'
+        required: false
+        default: ''
+      end_date:
+        description: 'Backfill end date (YYYY-MM-DD, inclusive, default yesterday UTC)'
+        required: false
+        default: ''
+      lookback_days:
+        description: 'Days to re-check ending yesterday (used when no dates are given)'
+        required: false
+        default: '3'
+      dry_run:
+        description: 'Dry Run (test extraction without saving to disk)'
+        required: false
+        default: false
+        type: boolean
+
+# Never let two pipeline runs write to the data directory at the same time.
+concurrency:
+  group: data-pipeline
+  cancel-in-progress: false
 
 jobs:
-  run-pipeline:
-    name: Run PySpark Pipeline
+  bronze:
+    name: Bronze Ingestion
     runs-on: self-hosted
-    
+    timeout-minutes: 120
+    env:
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}
+      # Inputs are passed via env (not inlined into the script) to prevent shell injection.
+      IN_TARGET_DATE: ${{ github.event.inputs.target_date }}
+      IN_START_DATE: ${{ github.event.inputs.start_date }}
+      IN_END_DATE: ${{ github.event.inputs.end_date }}
+      IN_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '3' }}
+      IN_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v7
+      - name: Checkout code
+        uses: actions/checkout@v7
 
-    - name: Run Pipeline
-      env:
-        SPARK_HOME: /opt/spark
-        JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
-      run: |
-        # Activate the environment
-        source ~/spark-env/bin/activate
-          
-        # Run the pipeline
-        echo "=== Starting Data Pipeline Execution ==="
-        python $GITHUB_WORKSPACE/run_pipeline.py all
+      - name: Install dependencies
+        run: |
+          source ~/spark-env/bin/activate
+          pip install -r requirements.txt
 
-        echo ""
-        echo "=== All Pipelines Completed Successfully ==="
+      - name: Run unit tests
+        run: |
+          source ~/spark-env/bin/activate
+          pytest -q
+
+      - name: Run Bronze Ingestion
+        run: |
+          set -euo pipefail
+          source ~/spark-env/bin/activate
+          mkdir -p "$DAT535_DATA_DIR/bronze"
+
+          date_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          ARGS=()
+          if [ -n "$IN_TARGET_DATE" ]; then
+            [[ "$IN_TARGET_DATE" =~ $date_re ]] || { echo "Invalid target_date"; exit 2; }
+            ARGS+=(--date "$IN_TARGET_DATE")
+          elif [ -n "$IN_START_DATE" ]; then
+            [[ "$IN_START_DATE" =~ $date_re ]] || { echo "Invalid start_date"; exit 2; }
+            ARGS+=(--start-date "$IN_START_DATE" --request-delay 0.5)
+            if [ -n "$IN_END_DATE" ]; then
+              [[ "$IN_END_DATE" =~ $date_re ]] || { echo "Invalid end_date"; exit 2; }
+              ARGS+=(--end-date "$IN_END_DATE")
+            fi
+          else
+            [[ "$IN_LOOKBACK_DAYS" =~ ^[0-9]+$ ]] || { echo "Invalid lookback_days"; exit 2; }
+            ARGS+=(--lookback-days "$IN_LOOKBACK_DAYS")
+          fi
+          if [ "$IN_DRY_RUN" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          echo "=== Executing Bronze Ingestion: ${ARGS[*]} ==="
+          python src/ingestion/ingest_daily.py "${ARGS[@]}"
+
+      - name: Write GitHub Step Summary
+        if: always()
+        run: |
+          echo "## Bronze Ingestion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Run Number | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target Date | ${IN_TARGET_DATE:-–} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Range | ${IN_START_DATE:-–} → ${IN_END_DATE:-–} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lookback Days | ${IN_LOOKBACK_DAYS} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | ${IN_DRY_RUN} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bronze Directory | $DAT535_DATA_DIR/bronze |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered By | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

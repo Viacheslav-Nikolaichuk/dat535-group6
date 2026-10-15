@@ -1,204 +1,171 @@
-# DAT535 
+# DAT535 Data Engineering: Regional Power Grid Economics and Microclimate Dynamics
 
-## Spark Lab Pipelines
+An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta Lake/Parquet**, and **GitHub Actions** running on a self-hosted VM runner to ingest, clean, harmonize, and model Norwegian regional electricity spot prices alongside localized meteorological observations across bidding zones `NO1`–`NO5`.
 
-Spark pipelines for learning distributed data processing.
+---
 
-### Repo Structure
+## Repository Structure
 
 ```text
 .
-├── README.md                    # This file
-├── project_cicd_guide.md        # Dev/Prod CI/CD hands-on guide (GitHub Environments, branch strategy, exercise)
-├── run_pipeline.py              # Pipeline orchestrator (lab2 -> lab3)
-├── lab2_pipeline.py             # Lab 2: Fundamentals + MapReduce + Medallion Architecture
-├── lab3_pipeline.py             # Lab 3: Window functions, joins, UDFs, streaming, production patterns
-├── lab1_install-spark.sh        # Lab 1: Bash script to install Spark, Java, Python 3.11 & packages
-├── lab2_spark_fundamentals.ipynb# Lab 2 notebook: Fundamentals + MapReduce + Medallion Architecture
-├── lab3_advanced_spark.ipynb    # Lab 3 notebook: Window functions, joins, UDFs, streaming, production patterns
-└── .github/
-    └── workflows/
-        ├── pipeline.yml         # Scheduled & dispatch pipeline workflow
-        ├── dat535-dev.yml       # Dev branch CI pipeline workflow
-        └── dat535-prod.yml      # Main branch production deployment workflow
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                         # Unit tests on GitHub-hosted runners (push to dev, PRs to dev/main)
+│       └── pipeline.yml                   # Daily medallion pipeline on the VM runner (cron 02:00 UTC; Bronze for now)
+├── config/
+│   ├── settings.py                        # Path resolutions, env loader, and API base settings
+│   └── zones_and_stations.json            # Mapping of bidding zones NO1-NO5 to MET Norway weather stations
+├── src/
+│   ├── ingestion/
+│   │   ├── __init__.py
+│   │   ├── strompris_client.py            # Hva Koster Strømmen API extractor
+│   │   ├── frost_client.py                # MET Norway Frost API extractor (auth & error handling)
+│   │   ├── bronze_writer.py               # Metadata audit envelopes & versioned, checksum-deduplicated JSON storage
+│   │   └── ingest_daily.py                # Ingestion entrypoint CLI (daily, lookback catch-up, backfill)
+│   └── utils/
+│       ├── hashing.py                     # Batch UUID4, ISO-8601 UTC, and SHA-256 payload checksums
+│       └── http.py                        # Shared requests.Session with retry/backoff & User-Agent
+├── scripts/
+│   └── test_api_connections.py            # Diagnostic smoke-test for API connectivity & credentials
+├── tests/
+│   └── test_ingestion.py                  # PyTest suite for hashing, envelopes, versioning, CLI dates, and clients
+├── labs/                                  # Archived course laboratory materials (Lab 1, 2, 3)
+│   ├── lab1_1_setup_guide.md
+│   ├── lab1_install-spark.sh
+│   ├── lab2_pipeline.py
+│   ├── lab2_spark_fundamentals.ipynb
+│   ├── lab3_advanced_spark.ipynb
+│   ├── lab3_pipeline.py
+│   ├── run_pipeline.py
+│   ├── project_cicd_guide.md
+│   └── workflows/                         # Disabled lab workflows (dat535-dev, dat535-prod, pipeline)
+├── docs/                                  # Project guides & documentation
+│   └── Data_Engineering_Project_Definition_Guide_v3.pdf
+├── dat535_data_engineering_project_definition.md # Official project specification & architecture
+├── pyproject.toml                         # Pytest configuration (import path, test discovery)
+├── requirements.txt                       # Project Python dependencies
+└── .env.example                           # Template for local environment variables & API keys
 ```
 
-### Overview
+---
 
-The Jupyter notebooks in this folder teach Apache Spark end-to-end across **two consolidated labs**
-that share **one single e-commerce clickstream dataset** (generated once in Lab 2, reused by Lab 3):
+## Data Sources & Architecture
 
-| Lab   | Notebook                        | Key Concepts                                                                                                                                                                                                                                                 |
-| ----- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Lab 2 | `lab2_spark_fundamentals.ipynb` | SparkSession & architecture, RDD/DataFrame/SQL/pandas conversions, column ops & type casting, filtering/sorting/aggregations, Parquet/CSV/JSON I/O, MapReduce with RDDs, the Medallion Architecture (Bronze/Silver/Gold)                                     |
-| Lab 3 | `lab3_advanced_spark.ipynb`     | Window functions, partitioning strategies, caching/persistence, every join type + broadcast joins, query optimization, UDFs vs pandas UDFs vs built-ins, Structured Streaming basics, production patterns (incremental processing, data quality, SCD Type 2) |
+### 1. Electricity Spot Prices (Strømpris API)
+* **Provider**: `hvakosterstrommen.no`
+* **Format**: Hourly spot prices per bidding zone (`NO1`, `NO2`, `NO3`, `NO4`, `NO5`).
+* **Authentication**: Free, open REST API (no key required).
+* **Schedule**: Day-ahead auction prices for tomorrow are published daily around **13:00 CET**.
 
-The `.py` pipeline scripts (`lab2_pipeline.py`, `lab3_pipeline.py`, `run_pipeline.py`) mirror the same
-two-lab structure as the notebooks: `lab2_pipeline.py` generates the shared dataset and builds the
-Medallion pipeline, and `lab3_pipeline.py` loads Lab 2's Silver output and runs the advanced/production
-patterns. Run Lab 2 before Lab 3 (or use `python run_pipeline.py all`).
+### 2. Meteorological Observations (MET Norway Frost API)
+* **Provider**: `frost.met.no`
+* **Format**: Hourly surface observations (`air_temperature`, `wind_speed`) from official meteorological stations. Requests use `timeresolutions=PT1H`; without it some stations also return 1-minute and 10-minute series (~2 MB/day instead of ~25 KB).
+* **Authentication**: Free instant registration requiring a `Client ID` from [Frost Credentials](https://frost.met.no/auth/requestCredentials.html).
+* **Nature of Data**: Empirical physical sensor observations (available up to the current hour; not predictive forecasts).
 
-### Quick Start
+### 3. Medallion Storage Tiers
+* **Bronze Layer**: Immutable, append-only raw JSON payloads wrapped in an audit envelope containing `_batch_id`, `_ingestion_timestamp_utc`, `_source_uri`, `_payload_checksum` (SHA-256), `_is_synthetic`, and `_schema_version`.
+  * Electricity: `/bronze/electricity/zone={zone}/year={YYYY}/month={MM}/{YYYY}_{MM}_{DD}__{ingestTs}_{batch}.json`
+  * Weather: `/bronze/weather/station={station_id}/year={YYYY}/month={MM}/{YYYY}_{MM}_{DD}__{ingestTs}_{batch}.json`
+  * **Versioning**: files are never overwritten. On re-ingestion the new payload checksum is compared with the latest version for that date: identical → skipped (`unchanged`); different → written as a new version (`new_version`, e.g. MET Norway QC revisions). Silver keeps the latest version per key via `_ingestion_timestamp_utc`. Legacy `{YYYY}_{MM}_{DD}.json` files are treated as the first version.
+  * **Day boundaries**: a price file for date `D` covers the Norwegian local day (23 or 25 hours on DST days); a weather file covers the UTC day. Silver must join on the UTC hour across files, not per file.
+  * **Atomic writes**: files are written to a hidden `.{name}.tmp` file and then renamed, so a crashed run never leaves a partial file that Spark would read (Spark skips names starting with `.` or `_`).
+  * **Run manifests**: every non-dry run writes `/bronze/_manifests/run__{batch_id}.json` with record counts, errors, and `written_files` (paths relative to `/bronze`, with `created`/`new_version` status). Silver can use it to process only new files instead of rescanning Bronze.
+* **Silver Layer** *(Upcoming)*: Strongly typed PySpark schema enforcement, UTC timezone harmonization, deduplication window functions, forward-fill gap imputation, Heating Degree Hours (HDH) calculation, and DLQ quarantine.
+* **Gold Layer** *(Upcoming)*: Serving assets for regional grid economics and price sensitivity features.
 
-1. **Install Prerequisites (Lab 1)**:
+---
 
-    Complete the `lab1_install-spark.sh` script on Ubuntu VM for clearting Spark.
+## Getting Started
 
-   ```bash
-   chmod +x lab1_install-spark.sh
-   ./lab1_install-spark.sh
-   source ~/spark-env/bin/activate
-   ```
+### 1. Configure Credentials
 
-2. Run Pipeline Scripts:
-
-    ```bash
-    # Run individual labs
-    python run_pipeline.py lab2
-    python run_pipeline.py lab3
-
-    # Run all labs (Lab 2 then Lab 3)
-    python run_pipeline.py all
-    ```
-
-### Lab Details
-
-#### Lab 2: Spark Fundamentals & the Medallion Architecture
-
-**Learning Objectives:**
-
-- Create and configure a SparkSession; understand driver/executor/task/partition
-- Convert data between RDD, DataFrame, SQL views and pandas
-- Perform DataFrame operations (select, withColumn, cast, filter, sort)
-- Run aggregations and groupBy operations
-- Read/write data in multiple formats (Parquet, CSV, JSON, partitioned)
-- Apply MapReduce patterns directly with RDDs (map, flatMap, reduceByKey)
-- Build a Bronze -> Silver -> Gold pipeline with data-quality quarantining
-
-**Output (shared with Lab 3):**
-
-```text
-~/spark-lab-data/shared/
-├── bronze/events/
-├── silver/
-│   ├── events/
-│   └── quarantine/
-└── gold/
-    ├── daily_metrics/
-    ├── user_metrics/
-    ├── product_metrics/
-    └── category_metrics/
-
-~/spark-lab-data/lab2/            # scratch I/O examples (parquet/csv/json/partitioned)
-```
-
-#### Lab 3: Advanced Spark & Production Patterns
-
-**Learning Objectives:**
-
-- Master window functions (ranking, lag/lead, running totals, moving averages)
-- Understand partitioning strategies and partition pruning
-- Implement caching/persistence and compare storage levels
-- Perform every join type (inner/left/right/full/semi/anti) and optimize with broadcast joins
-- Apply query optimization techniques (filter/column pushdown, execution plans)
-- Compare UDFs, pandas UDFs and built-in functions
-- Build a minimal Structured Streaming pipeline with a windowed aggregation
-- Learn production patterns: incremental processing, data quality checks, SCD Type 2, safe aggregation
-
-**Input:** loads the Silver-layer dataset produced by Lab 2 from `~/spark-lab-data/shared/silver/events`
-(run Lab 2 first).
-
-**Output:**
-
-```text
-~/spark-lab-data/lab3/
-└── partitioned_data/
-    ├── no_partition/
-    ├── date_partition/
-    └── multi_partition/
-```
-
-## GitHub Actions CI/CD Guide
-
-The repo contains the automated workflows for the DAT535 project. These workflows use GitHub Actions to schedule data pipelines, execute Spark jobs, and deploy code updates.
-
-**Important**: These pipelines are designed to execute on **self-hosted runners** configured with Apache Spark and Java.
-
-**For the full dev/prod concepts, GitHub Environments setup, and hands-on exercise, see [project_cicd_guide.md](project_cicd_guide.md).**
-
-### Available Workflows
-
-We have configured the following automated processes:
-
-#### Pipeline ([pipeline.yml](.github/workflows/pipeline.yml))
-
-- **Triggers**:
-  - Scheduled cron job (monthly, 1st of the month at 00:00 UTC: `0 0 1 * *` which can be changed).
-  - Manual dispatch (workflow_dispatch).
-  - Push to `main` is defined in the file but currently commented out.
-
-- **Key Tasks**:
-  - Checks out the repository code.
-  - Activates the Python environment (`source ~/spark-env/bin/activate`).
-  - Sets environment variables (`SPARK_HOME=/opt/spark`, `JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64`).
-  - Executes all pipelines via `python $GITHUB_WORKSPACE/run_pipeline.py all`.
-
-### Infrastructure & Environment Setup
-
-These workflows use `runs-on: self-hosted` targeting self-hosted infrastructure equipped with PySpark.
-
-#### Self-Hosted Runner Requirements
-
-The runner environment requires the following predefined paths and dependencies:
-
-- **Python Virtual Environment**: `~/spark-env/`
-- **Spark Home**: `/opt/spark`
-- **Java Home**: `/usr/lib/jvm/java-8-openjdk-amd64`
-
-**⚠️ Note for Personal Forks:**
-If you fork this repository to your personal GitHub account, you will need to set up a self-hosted runner with Spark and Java installed.
-
-### Setting up a Self-Hosted Runner
-
-To execute these pipelines on your own infrastructure (e.g., your VM), follow these steps:
-
-#### Step 1: Register and Start Runner
-
-1. Go to your repository on GitHub.
-2. Navigate to **Settings** > **Actions** > **Runners** > **New self-hosted runner**.
-3. Select the operating system (linux) and architecture matching (x64) your runner host.
-4. Execute the configuration commands provided by GitHub on the VM:
+Create a local `.env` file (copied from `.env.example`):
 
 ```bash
-# Create a folder
-mkdir actions-runner && cd actions-runner
-
-# Download the runner package (Get the specific link for your OS from GitHub UI > Settings > Actions > Runners)
-curl -o actions-runner-osx-x64-2.337.0.tar.gz -L https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-osx-x64-2.337.0.tar.gz
-
-# Extract
-tar xzf ./actions-runner-osx-x64-2.337.0.tar.gz
-
-# Configure (You will need the token from the GitHub UI)
-./config.sh --url https://github.com/OWNER/REPO --token YOUR_TOKEN
-
-# Start the runner
-# To keep the runner alive after closing the terminal, install as a service:
-sudo ./svc.sh install 
-sudo ./svc.sh start
+cp .env.example .env
 ```
 
-#### Step 2: Triggering Manually
+Add your MET Norway Client ID into `.env`:
 
-You can test a pipeline without waiting for the schedule:
+```env
+FROST_CLIENT_ID=your_frost_client_id_here
+DAT535_DATA_DIR=./data
+```
 
-1. Go to the **Actions** tab.
-2. Select a workflow (e.g., "Pipeline") from the left sidebar.
-3. Click the **Run workflow** dropdown button on the right.
-4. Click **Run workflow**.
+*(Note: `.env` is listed in `.gitignore` and is never committed to git).*
 
-### CI/CD Troubleshooting
+### 2. Install Dependencies
 
-- **Virtual Environment Not Found**: Ensure `~/spark-env/bin/activate` exists on the self-hosted runner.
-- **Java / Spark Path Mismatch**: Verify `JAVA_HOME` and `SPARK_HOME` paths on your runner match the environment settings.
-- **Permission Denied**: If `run_pipeline.py` fails to run, make it executable via `git update-index --chmod=+x run_pipeline.py`.
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Run Diagnostic Smoke Test
+
+Verify network connectivity, latency, credentials, and API response parsing:
+
+```bash
+python scripts/test_api_connections.py
+```
+
+### 4. Run Unit Tests
+
+Execute the automated test suite:
+
+```bash
+pytest tests/test_ingestion.py -v
+```
+
+The same suite runs automatically in `.github/workflows/ci.yml` on every push to `dev` and every pull request to `dev`/`main`. It uses GitHub-hosted runners, so the self-hosted VM runner is used only for jobs that touch real data.
+
+---
+
+## Daily Ingestion Pipeline
+
+### Running Manually
+
+```bash
+# 1. Ingest yesterday's complete 24h data (default)
+python src/ingestion/ingest_daily.py
+
+# 2. Ingest a specific historical date
+python src/ingestion/ingest_daily.py --date 2024-01-15
+
+# 3. Lookback catch-up: re-check the last 3 days (catches missed runs & MET revisions)
+python src/ingestion/ingest_daily.py --lookback-days 3
+
+# 4. Historical backfill: date range with rate-limit pacing (e.g., 0.5s between calls)
+python src/ingestion/ingest_daily.py --start-date 2023-01-01 --end-date 2023-12-31 --request-delay 0.5
+
+# 5. Dry run mode (validates API connectivity and parsing without writing to disk)
+python src/ingestion/ingest_daily.py --date 2024-01-15 --dry-run
+```
+
+### Running on the VM Runner via GitHub Actions
+
+The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It currently has one job (`bronze`); Silver and Gold will be added as dependent jobs in the same workflow.
+
+1. **Schedule**: Daily at `02:00 UTC` (cron `0 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main`.
+2. **Quality Gate**: Runs the unit test suite (`pytest -q`) automatically prior to executing ingestion.
+3. **Concurrency & Safety**: Protected by a GitHub Actions concurrency lock (`data-pipeline`) and strict regex parameter sanitization to prevent race conditions or shell injection.
+4. **Manual Dispatch**: Go to **Actions** -> **Data Pipeline** -> **Run workflow**:
+   - Provide a `target_date` for a single day rerun.
+   - Or provide `start_date` and `end_date` for bulk historical backfills.
+   - Or adjust `lookback_days` (defaults to 3).
+   - Optional `dry_run` checkbox.
+
+Make sure `FROST_CLIENT_ID` is saved in your GitHub Repository under **Settings** > **Secrets and variables** > **Actions** > **New repository secret**.
+
+---
+
+## Lab Exercises (Labs 1, 2, 3)
+
+The previous lab exercises and notebooks have been moved to the `labs/` directory to keep the root directory clean:
+
+```bash
+cd labs
+python run_pipeline.py all
+```
+
+The lab GitHub Actions workflows are kept in `labs/workflows/` for reference only. GitHub runs workflows only from `.github/workflows/`, so they no longer trigger on push, PR, or schedule and don't occupy the self-hosted runner.
