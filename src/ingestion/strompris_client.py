@@ -4,11 +4,12 @@ Fetches hourly Norwegian electricity spot prices for bidding zones NO1 through N
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import requests
 
 from config.settings import PRICE_ZONES, STROMPRIS_BASE_URL
 from src.utils.hashing import parse_date_components
+from src.utils.http import build_session
 
 logger = logging.getLogger(__name__)
 
@@ -16,9 +17,9 @@ logger = logging.getLogger(__name__)
 class StromprisClient:
     """HTTP client for extracting electricity spot prices from hvakosterstrommen.no."""
 
-    def __init__(self, base_url: str = STROMPRIS_BASE_URL, session: requests.Session = None):
+    def __init__(self, base_url: str = STROMPRIS_BASE_URL, session: Optional[requests.Session] = None):
         self.base_url = base_url.rstrip("/")
-        self.session = session or requests.Session()
+        self.session = session or build_session()
 
     def build_url(self, date_str: str, zone: str) -> str:
         """

@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Put the project root on sys.path so `config` and `src` are importable without
+# __init__.py files, and limit discovery to tests/ so scripts/ (which hits live APIs)
+# is never collected.
+pythonpath = ["."]
+testpaths = ["tests"]

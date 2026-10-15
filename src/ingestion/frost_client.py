@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from config.settings import FROST_BASE_URL, FROST_CLIENT_ID
+from src.utils.http import build_session
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ class FrostClient:
     ):
         self.client_id = (client_id if client_id is not None else FROST_CLIENT_ID).strip()
         self.base_url = base_url.rstrip("/")
-        self.session = session or requests.Session()
+        self.session = session or build_session()
 
     def fetch_observations(
         self,
@@ -42,10 +43,12 @@ class FrostClient:
             station_id: MET station identifier (e.g. 'SN18700').
             elements: List of weather elements (default: ['air_temperature', 'wind_speed']).
             timeout: Request timeout in seconds.
-            allow_mock_fallback: If True and client_id is missing, returns synthetic records.
+            allow_mock_fallback: If True and client_id is missing, returns synthetic records
+                flagged with is_synthetic=True. Must be explicitly opted into by the caller;
+                never enable this implicitly in production.
 
         Returns:
-            Dictionary containing metadata, raw observations, and source URI.
+            Dictionary containing metadata, raw observations, source URI, and is_synthetic flag.
         """
         if elements is None:
             elements = ["air_temperature", "wind_speed"]
@@ -106,6 +109,7 @@ class FrostClient:
                 "record_count": 0,
                 "source_uri": response.url,
                 "records": [],
+                "is_synthetic": False,
             }
 
         response.raise_for_status()
@@ -119,6 +123,7 @@ class FrostClient:
             "record_count": len(records),
             "source_uri": response.url,
             "records": records,
+            "is_synthetic": False,
         }
 
     def _generate_mock_observations(
@@ -158,4 +163,5 @@ class FrostClient:
             "record_count": len(records),
             "source_uri": f"{self.base_url}/observations/mock?station={station_id}&date={date_str}",
             "records": records,
+            "is_synthetic": True,
         }
