@@ -11,7 +11,8 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                         # Unit tests on GitHub-hosted runners (push to dev, PRs to dev/main)
-│       └── pipeline.yml                   # Daily medallion pipeline on the VM runner (cron 02:00 UTC; Bronze for now)
+│       ├── pipeline.yml                   # Daily medallion pipeline on the VM runner (cron 02:00 UTC; Bronze for now)
+│       └── backfill.yml                   # Manual historical Bronze backfill on the VM runner (separate from daily)
 ├── config/
 │   ├── settings.py                        # Path resolutions, env loader, and API base settings
 │   └── zones_and_stations.json            # Mapping of bidding zones NO1-NO5 to MET Norway weather stations
@@ -22,6 +23,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   │   ├── frost_client.py                # MET Norway Frost API extractor (auth & error handling)
 │   │   ├── bronze_writer.py               # Metadata audit envelopes & versioned, checksum-deduplicated JSON storage
 │   │   ├── ingest_daily.py                # Ingestion entrypoint CLI (daily, lookback catch-up, backfill)
+│   │   └── backfill_historical.py         # Historical backfill CLI: month-by-month, resumable, outside the daily window
 │   │   └── chaos_injector.py              # Builds bronze_chaos/: a Bronze copy with ~1% injected errors
 │   └── utils/
 │       ├── hashing.py                     # Batch UUID4, ISO-8601 UTC, and SHA-256 payload checksums
@@ -30,6 +32,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   └── test_api_connections.py            # Diagnostic smoke-test for API connectivity & credentials
 ├── tests/
 │   ├── test_ingestion.py                  # PyTest suite for hashing, envelopes, versioning, CLI dates, and clients
+│   └── test_backfill.py                   # PyTest suite for the historical backfill (monthly runs, resume, date guard)
 │   └── test_chaos.py                      # PyTest suite for chaos injection (rates, determinism, Bronze untouched)
 ├── labs/                                  # Archived course laboratory materials (Lab 1, 2, 3)
 │   ├── lab1_1_setup_guide.md
@@ -167,6 +170,25 @@ The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hos
    - Optional `dry_run` checkbox.
 
 Make sure `FROST_CLIENT_ID` is saved in your GitHub Repository under **Settings** > **Secrets and variables** > **Actions** > **New repository secret**.
+
+---
+
+## Historical Backfill
+
+`src/ingestion/backfill_historical.py` loads multi-year history into the same `/bronze/` tree without interfering with the daily pipeline. It is a thin wrapper around the daily `run_ingestion()` (unchanged), so files, envelopes, and versioning are identical to daily ingestion.
+
+* **History available**: Strømpris prices start on **2021-10-01**; Frost has data well before that. The project backfills from **2022-01-01** (full calendar years).
+* **One run per calendar month**: each month gets its own batch ID and run manifest, so a crash or timeout loses at most the current month's manifest.
+* **Resumable**: months that already have a `SUCCESS` manifest are skipped. Rerun the same range after a failure; only unfinished months are requested again, and days already in Bronze are not rewritten (checksum `unchanged`).
+* **Separate from daily runs**: end dates inside the daily 3-day lookback window are refused (latest allowed end date = today − 4 days, UTC), so backfill and daily runs never write the same files. The workflow uses its own concurrency lock (`historical-backfill`), so a long backfill never delays the scheduled daily run.
+* **Runtime**: about 9 s per day with the default 0.5 s request delay, i.e. ~1 h per year (~19k files, ~210 MB of Bronze for 2022 → today).
+
+```bash
+python src/ingestion/backfill_historical.py --start-date 2022-01-01 --end-date 2022-12-31
+python src/ingestion/backfill_historical.py --start-date 2023-01-01 --end-date 2023-12-31 --request-delay 0.2
+```
+
+On the VM runner, use **Actions** -> **Historical Backfill** -> **Run workflow** (`.github/workflows/backfill.yml`, manual only, 6 h timeout) with a `start_date`, `end_date`, and optional `request_delay`. Running one calendar year per run is recommended.
 
 ---
 
