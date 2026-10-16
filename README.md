@@ -21,14 +21,16 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   │   ├── strompris_client.py            # Hva Koster Strømmen API extractor
 │   │   ├── frost_client.py                # MET Norway Frost API extractor (auth & error handling)
 │   │   ├── bronze_writer.py               # Metadata audit envelopes & versioned, checksum-deduplicated JSON storage
-│   │   └── ingest_daily.py                # Ingestion entrypoint CLI (daily, lookback catch-up, backfill)
+│   │   ├── ingest_daily.py                # Ingestion entrypoint CLI (daily, lookback catch-up, backfill)
+│   │   └── chaos_injector.py              # Builds bronze_chaos/: a Bronze copy with ~1% injected errors
 │   └── utils/
 │       ├── hashing.py                     # Batch UUID4, ISO-8601 UTC, and SHA-256 payload checksums
 │       └── http.py                        # Shared requests.Session with retry/backoff & User-Agent
 ├── scripts/
 │   └── test_api_connections.py            # Diagnostic smoke-test for API connectivity & credentials
 ├── tests/
-│   └── test_ingestion.py                  # PyTest suite for hashing, envelopes, versioning, CLI dates, and clients
+│   ├── test_ingestion.py                  # PyTest suite for hashing, envelopes, versioning, CLI dates, and clients
+│   └── test_chaos.py                      # PyTest suite for chaos injection (rates, determinism, Bronze untouched)
 ├── labs/                                  # Archived course laboratory materials (Lab 1, 2, 3)
 │   ├── lab1_1_setup_guide.md
 │   ├── lab1_install-spark.sh
@@ -71,6 +73,11 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
   * **Day boundaries**: a price file for date `D` covers the Norwegian local day (23 or 25 hours on DST days); a weather file covers the UTC day. Silver must join on the UTC hour across files, not per file.
   * **Atomic writes**: files are written to a hidden `.{name}.tmp` file and then renamed, so a crashed run never leaves a partial file that Spark would read (Spark skips names starting with `.` or `_`).
   * **Run manifests**: every non-dry run writes `/bronze/_manifests/run__{batch_id}.json` with record counts, errors, and `written_files` (paths relative to `/bronze`, with `created`/`new_version` status). Silver can use it to process only new files instead of rescanning Bronze.
+* **Bronze Chaos Copy** (`/bronze_chaos/`): the APIs return very clean data, so for Silver cleaning/DLQ exercises `chaos_injector.py` mirrors Bronze into a separate tree with ~1% of all records damaged. `/bronze/` is only read, never modified.
+  * **Error types**: `duplicate` (record emitted twice), `null_field` (price / observation value → `null`), `out_of_range` (`999.0` NOK/kWh, `999.9` °C), `bad_timestamp` (`"not-a-timestamp"`), and `corrupt_file` (file truncated mid-JSON). File corruption takes 20% of the budget, record errors 80%, so the expected share of damaged records stays ~1% overall.
+  * **Tamper evidence**: `_metadata` is copied unchanged, so a modified payload no longer matches its `_payload_checksum`.
+  * **Ground truth**: every run writes `/bronze_chaos/_manifests/run__{batch_id}.json` with the rate, seed, counts per error type, and every injected error (`file`, `type`, record `index`, `field`, `original` value). The data files carry no markers, so Silver must detect errors itself; its DLQ/dedup counts can then be scored against the union of these manifests.
+  * **Reproducible & incremental**: each file's errors are seeded from `(seed, relative path)`, so daily runs and historical backfills damage a file identically. Files already in `/bronze_chaos/` are skipped; delete the folder to rebuild with a different `--rate`/`--seed`.
 * **Silver Layer** *(Upcoming)*: Strongly typed PySpark schema enforcement, UTC timezone harmonization, deduplication window functions, forward-fill gap imputation, Heating Degree Hours (HDH) calculation, and DLQ quarantine.
 * **Gold Layer** *(Upcoming)*: Serving assets for regional grid economics and price sensitivity features.
 
@@ -140,11 +147,15 @@ python src/ingestion/ingest_daily.py --start-date 2023-01-01 --end-date 2023-12-
 
 # 5. Dry run mode (validates API connectivity and parsing without writing to disk)
 python src/ingestion/ingest_daily.py --date 2024-01-15 --dry-run
+
+# 6. Build/extend the chaos copy of Bronze (default: 1% errors, seed 42)
+python src/ingestion/chaos_injector.py
+python src/ingestion/chaos_injector.py --rate 0.02 --seed 7
 ```
 
 ### Running on the VM Runner via GitHub Actions
 
-The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It currently has one job (`bronze`); Silver and Gold will be added as dependent jobs in the same workflow.
+The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It currently has two jobs: `bronze` (ingestion) and `bronze_chaos` (extends `/bronze_chaos/` with the newly ingested files; runs only after `bronze` succeeds and is skipped on dry runs). Silver and Gold will be added as dependent jobs in the same workflow.
 
 1. **Schedule**: Daily at `02:00 UTC` (cron `0 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main`.
 2. **Quality Gate**: Runs the unit test suite (`pytest -q`) automatically prior to executing ingestion.

@@ -51,6 +51,7 @@ DEFAULT_DATA_DIR = os.environ.get(
 )
 DATA_DIR = Path(DEFAULT_DATA_DIR)
 BRONZE_DIR = DATA_DIR / "bronze"
+BRONZE_CHAOS_DIR = DATA_DIR / "bronze_chaos"  # Bronze copy with injected errors (never the source of truth)
 SILVER_DIR = DATA_DIR / "silver"
 GOLD_DIR = DATA_DIR / "gold"
 
