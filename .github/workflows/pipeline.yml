@@ -110,3 +110,24 @@ jobs:
           echo "| Dry Run | ${IN_DRY_RUN} |" >> $GITHUB_STEP_SUMMARY
           echo "| Bronze Directory | $DAT535_DATA_DIR/bronze |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered By | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+
+  bronze_chaos:
+    name: Bronze Chaos Copy
+    needs: bronze
+    # Nothing new is written to Bronze on a dry run, so there is nothing to copy.
+    if: github.event.inputs.dry_run != 'true'
+    runs-on: self-hosted
+    timeout-minutes: 60
+    env:
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Inject errors into Bronze copy
+        run: |
+          set -euo pipefail
+          source ~/spark-env/bin/activate
+          # Only Bronze files not yet in bronze_chaos/ are processed (default 1% rate, seed 42).
+          python src/ingestion/chaos_injector.py
