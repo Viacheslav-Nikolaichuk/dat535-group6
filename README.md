@@ -11,10 +11,10 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                         # Unit tests on GitHub-hosted runners (push to dev, PRs to dev/main)
-│       ├── pipeline.yml                   # Daily medallion pipeline on the VM runner (cron 02:00 UTC; Bronze for now)
-│       └── backfill.yml                   # Manual historical Bronze backfill on the VM runner (separate from daily)
+│       ├── pipeline.yml                   # Medallion pipeline on the VM runner (cron 02:00 UTC on main = prod; manual on dev = dev)
+│       └── backfill.yml                   # Manual historical Bronze backfill on the VM runner (main = prod, dev = dev)
 ├── config/
-│   ├── settings.py                        # Path resolutions, env loader, and API base settings
+│   ├── settings.py                        # dev/prod environment, data paths, env loader, and API base settings
 │   └── zones_and_stations.json            # Mapping of bidding zones NO1-NO5 to MET Norway weather stations
 ├── src/
 │   ├── ingestion/
@@ -34,6 +34,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   ├── test_ingestion.py                  # PyTest suite for hashing, envelopes, versioning, CLI dates, and clients
 │   └── test_backfill.py                   # PyTest suite for the historical backfill (monthly runs, resume, date guard)
 │   └── test_chaos.py                      # PyTest suite for chaos injection (rates, determinism, Bronze untouched)
+│   └── test_settings.py                   # PyTest suite for dev/prod environment and data path resolution
 ├── labs/                                  # Archived course laboratory materials (Lab 1, 2, 3)
 │   ├── lab1_1_setup_guide.md
 │   ├── lab1_install-spark.sh
@@ -100,10 +101,11 @@ Add your MET Norway Client ID into `.env`:
 
 ```env
 FROST_CLIENT_ID=your_frost_client_id_here
+DAT535_ENV=dev
 DAT535_DATA_DIR=./data
 ```
 
-*(Note: `.env` is listed in `.gitignore` and is never committed to git).*
+*(Note: `.env` is listed in `.gitignore` and is never committed to git).* Local runs then write to `./data/dev/` (see [Environments](#environments)).
 
 ### 2. Install Dependencies
 
@@ -124,10 +126,33 @@ python scripts/test_api_connections.py
 Execute the automated test suite:
 
 ```bash
-pytest tests/test_ingestion.py -v
+pytest -v
 ```
 
 The same suite runs automatically in `.github/workflows/ci.yml` on every push to `dev` and every pull request to `dev`/`main`. It uses GitHub-hosted runners, so the self-hosted VM runner is used only for jobs that touch real data.
+
+---
+
+## Environments
+
+Development and production are separated by the `DAT535_ENV` variable (`dev` or `prod`, default `dev`). Each environment has its own data tree under the data root (`DAT535_DATA_DIR`), so a dev run can never overwrite production data:
+
+```text
+~/spark-project-data/            # data root on the VM (DAT535_DATA_DIR)
+├── prod/   bronze/  bronze_chaos/  silver/  gold/
+└── dev/    bronze/  ...
+```
+
+| Environment | Who runs it | Git branch | Data directory |
+|---|---|---|---|
+| `dev` | Local runs, manual VM runs | `dev` (and local feature branches) | `<data root>/dev/` |
+| `prod` | Daily schedule + manual runs | `main` only | `<data root>/prod/` |
+
+* **Default is `dev`**: running a script without `DAT535_ENV` (locally or over SSH on the VM) never touches prod. An unknown value fails at startup.
+* **Branch → environment**: `pipeline.yml` and `backfill.yml` derive `DAT535_ENV` from the branch they run on (`main` → `prod`, `dev` → `dev`). A *Guard branch* step fails any other branch before it can write data. The cron schedule only fires on `main`, so scheduled runs are always prod.
+* **GitHub environments**: jobs run in the `prod` or `dev` GitHub environment. `prod` is restricted to the `main` branch under **Settings** → **Environments** → `prod` → **Deployment branches**.
+* **Dev → prod flow**: develop on a feature branch → PR to `dev` (CI tests) → try it on the VM with **Run workflow** on branch `dev` (writes to `dev/`) → PR `dev` → `main` → the next scheduled run uses it on `prod/`.
+* **Logs**: every run logs `Environment: <env>` and its data directory, and the step summary shows the environment and branch.
 
 ---
 
@@ -158,12 +183,12 @@ python src/ingestion/chaos_injector.py --rate 0.02 --seed 7
 
 ### Running on the VM Runner via GitHub Actions
 
-The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It currently has two jobs: `bronze` (ingestion) and `bronze_chaos` (extends `/bronze_chaos/` with the newly ingested files; runs only after `bronze` succeeds and is skipped on dry runs). Silver and Gold will be added as dependent jobs in the same workflow.
+The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It currently has two jobs: `bronze` (ingestion) and `bronze_chaos` (extends `/bronze_chaos/` with the newly ingested files; runs only after `bronze` succeeds and is skipped on dry runs). Silver and Gold will be added as dependent jobs in the same workflow. Runs from `main` write to `prod/`, runs from `dev` to `dev/` (see [Environments](#environments)).
 
-1. **Schedule**: Daily at `02:00 UTC` (cron `0 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main`.
+1. **Schedule**: Daily at `02:00 UTC` (cron `0 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main` (prod).
 2. **Quality Gate**: Runs the unit test suite (`pytest -q`) automatically prior to executing ingestion.
-3. **Concurrency & Safety**: Protected by a GitHub Actions concurrency lock (`data-pipeline`) and strict regex parameter sanitization to prevent race conditions or shell injection.
-4. **Manual Dispatch**: Go to **Actions** -> **Data Pipeline** -> **Run workflow**:
+3. **Concurrency & Safety**: Protected by a concurrency lock per branch (`data-pipeline-main`, `data-pipeline-dev`), so two runs never write the same environment at once and dev runs never delay prod. Inputs are checked with strict regexes to prevent shell injection.
+4. **Manual Dispatch**: Go to **Actions** -> **Data Pipeline** -> **Run workflow**, choose the branch (`main` = prod, `dev` = dev):
    - Provide a `target_date` for a single day rerun.
    - Or provide `start_date` and `end_date` for bulk historical backfills.
    - Or adjust `lookback_days` (defaults to 3).
@@ -180,7 +205,7 @@ Make sure `FROST_CLIENT_ID` is saved in your GitHub Repository under **Settings*
 * **History available**: Strømpris prices start on **2021-10-01**; Frost has data well before that. The project backfills from **2022-01-01** (full calendar years).
 * **One run per calendar month**: each month gets its own batch ID and run manifest, so a crash or timeout loses at most the current month's manifest.
 * **Resumable**: months that already have a `SUCCESS` manifest are skipped. Rerun the same range after a failure; only unfinished months are requested again, and days already in Bronze are not rewritten (checksum `unchanged`).
-* **Separate from daily runs**: end dates inside the daily 3-day lookback window are refused (latest allowed end date = today − 4 days, UTC), so backfill and daily runs never write the same files. The workflow uses its own concurrency lock (`historical-backfill`), so a long backfill never delays the scheduled daily run.
+* **Separate from daily runs**: end dates inside the daily 3-day lookback window are refused (latest allowed end date = today − 4 days, UTC), so backfill and daily runs never write the same files. The workflow uses its own concurrency lock per branch (`historical-backfill-main`, `historical-backfill-dev`), so a long backfill never delays the scheduled daily run.
 * **Runtime**: about 9 s per day with the default 0.5 s request delay, i.e. ~1 h per year (~19k files, ~210 MB of Bronze for 2022 → today).
 
 ```bash
@@ -188,7 +213,7 @@ python src/ingestion/backfill_historical.py --start-date 2022-01-01 --end-date 2
 python src/ingestion/backfill_historical.py --start-date 2023-01-01 --end-date 2023-12-31 --request-delay 0.2
 ```
 
-On the VM runner, use **Actions** -> **Historical Backfill** -> **Run workflow** (`.github/workflows/backfill.yml`, manual only, 6 h timeout) with a `start_date`, `end_date`, and optional `request_delay`. Running one calendar year per run is recommended.
+On the VM runner, use **Actions** -> **Historical Backfill** -> **Run workflow** (`.github/workflows/backfill.yml`, manual only, 6 h timeout) with a `start_date`, `end_date`, and optional `request_delay`. Running one calendar year per run is recommended. Run it from `main` to backfill prod; from `dev` it fills `dev/` (useful for a one-month test).
 
 ---
 
