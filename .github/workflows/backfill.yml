@@ -1,0 +1,98 @@
+name: Historical Backfill
+
+# Manual-only historical Bronze backfill on the self-hosted runner, kept separate from the
+# daily pipeline (pipeline.yml). It writes into the same Bronze tree, but the script refuses
+# dates inside the daily lookback window, so the two never write the same files.
+# Rerunning with the same dates resumes: months with a SUCCESS manifest are skipped.
+# Environment follows the branch: main backfills prod, dev backfills dev (e.g. one month to test).
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Backfill start date (YYYY-MM-DD, inclusive), e.g. 2022-01-01'
+        required: true
+      end_date:
+        description: 'Backfill end date (YYYY-MM-DD, inclusive), at most today minus 4 days'
+        required: true
+      request_delay:
+        description: 'Seconds to sleep between API requests'
+        required: false
+        default: '0.5'
+
+# Own lock per environment: a long backfill never blocks or waits for the daily pipeline,
+# but two backfills of the same environment never run at the same time.
+concurrency:
+  group: historical-backfill-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    name: Bronze Backfill
+    runs-on: self-hosted
+    timeout-minutes: 360
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+    env:
+      DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}
+      # Inputs are passed via env (not inlined into the script) to prevent shell injection.
+      IN_START_DATE: ${{ github.event.inputs.start_date }}
+      IN_END_DATE: ${{ github.event.inputs.end_date }}
+      IN_REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.5' }}
+
+    steps:
+      # main writes prod, dev writes dev; any other branch is refused before touching data.
+      - name: Guard branch
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|dev) ;;
+            *) echo "::error::Data workflows only run from main (prod) or dev (dev), not '$GITHUB_REF_NAME'"; exit 1 ;;
+          esac
+          if [ "$DAT535_ENV" = "prod" ] && [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Only main may write to prod"; exit 1
+          fi
+          echo "Environment: $DAT535_ENV -> $DAT535_DATA_DIR/$DAT535_ENV"
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          source ~/spark-env/bin/activate
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          source ~/spark-env/bin/activate
+          pytest -q
+
+      - name: Run Historical Backfill
+        run: |
+          set -euo pipefail
+          source ~/spark-env/bin/activate
+          mkdir -p "$DAT535_DATA_DIR/$DAT535_ENV/bronze"
+
+          date_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          [[ "$IN_START_DATE" =~ $date_re ]] || { echo "Invalid start_date"; exit 2; }
+          [[ "$IN_END_DATE" =~ $date_re ]] || { echo "Invalid end_date"; exit 2; }
+          [[ "$IN_REQUEST_DELAY" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "Invalid request_delay"; exit 2; }
+
+          echo "=== Historical Backfill: $IN_START_DATE -> $IN_END_DATE (delay ${IN_REQUEST_DELAY}s) ==="
+          python src/ingestion/backfill_historical.py \
+            --start-date "$IN_START_DATE" \
+            --end-date "$IN_END_DATE" \
+            --request-delay "$IN_REQUEST_DELAY"
+
+      - name: Write GitHub Step Summary
+        if: always()
+        run: |
+          echo "## Historical Backfill Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${DAT535_ENV} (branch ${{ github.ref_name }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run Number | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Range | ${IN_START_DATE} → ${IN_END_DATE} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Request Delay | ${IN_REQUEST_DELAY}s |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bronze Directory | $DAT535_DATA_DIR/$DAT535_ENV/bronze |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered By | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

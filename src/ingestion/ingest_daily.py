@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.settings import (
     BRONZE_DIR,
+    DAT535_ENV,
     PRICE_ZONES,
     ZONES_CONFIG_FILE,
 )
@@ -210,6 +211,7 @@ def run_ingestion(
 
     logger.info("=" * 65)
     logger.info("STARTING BRONZE INGESTION PIPELINE")
+    logger.info(f"Environment:   {DAT535_ENV}")
     logger.info(f"Run Batch ID:  {batch_id}")
     logger.info(f"Date Range:    {dates[0]} -> {dates[-1]} ({len(dates)} day(s), UTC)")
     logger.info(f"Target Zones:  {', '.join(target_zones)}")
