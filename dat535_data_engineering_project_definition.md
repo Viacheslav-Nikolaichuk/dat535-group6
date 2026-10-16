@@ -151,7 +151,7 @@ Supports energy consumption forecasting, regional grid congestion analysis, and 
 GitHub Actions automates PyTest execution on pull requests, testing API retries, schema validation, and Spark transformations against mock fixtures. Merged code deploys scheduled pipelines executing Bronze to Gold refreshes.
 
 ### Environment Separation
-Strict separation between `dev` (local/mocked data runs) and `prod` environment configs managed via environment variables.
+Strict separation between `dev` and `prod`, selected by the `DAT535_ENV` environment variable (default `dev`). Each environment writes to its own data tree (`<data root>/dev/`, `<data root>/prod/`). `dev` covers local runs, CI tests with mocked APIs, and manual VM runs from the `dev` branch. `prod` is written only by workflows running from `main`: the daily schedule and manual runs. Workflows derive the environment from the branch, refuse any other branch, and run in the matching GitHub environment, with `prod` restricted to `main`.
 
 ### Observability
 Pipeline logs track batch completion status, rejected records count, and data quality check results.

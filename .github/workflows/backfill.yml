@@ -4,6 +4,7 @@ name: Historical Backfill
 # daily pipeline (pipeline.yml). It writes into the same Bronze tree, but the script refuses
 # dates inside the daily lookback window, so the two never write the same files.
 # Rerunning with the same dates resumes: months with a SUCCESS manifest are skipped.
+# Environment follows the branch: main backfills prod, dev backfills dev (e.g. one month to test).
 
 on:
   workflow_dispatch:
@@ -19,10 +20,10 @@ on:
         required: false
         default: '0.5'
 
-# Own lock: a long backfill never blocks or waits for the daily pipeline,
-# but two backfills never run at the same time.
+# Own lock per environment: a long backfill never blocks or waits for the daily pipeline,
+# but two backfills of the same environment never run at the same time.
 concurrency:
-  group: historical-backfill
+  group: historical-backfill-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -30,7 +31,9 @@ jobs:
     name: Bronze Backfill
     runs-on: self-hosted
     timeout-minutes: 360
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
     env:
+      DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
       DAT535_DATA_DIR: /home/ubuntu/spark-project-data
       FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}
       # Inputs are passed via env (not inlined into the script) to prevent shell injection.
@@ -39,6 +42,18 @@ jobs:
       IN_REQUEST_DELAY: ${{ github.event.inputs.request_delay || '0.5' }}
 
     steps:
+      # main writes prod, dev writes dev; any other branch is refused before touching data.
+      - name: Guard branch
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|dev) ;;
+            *) echo "::error::Data workflows only run from main (prod) or dev (dev), not '$GITHUB_REF_NAME'"; exit 1 ;;
+          esac
+          if [ "$DAT535_ENV" = "prod" ] && [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Only main may write to prod"; exit 1
+          fi
+          echo "Environment: $DAT535_ENV -> $DAT535_DATA_DIR/$DAT535_ENV"
+
       - name: Checkout code
         uses: actions/checkout@v7
 
@@ -56,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           source ~/spark-env/bin/activate
-          mkdir -p "$DAT535_DATA_DIR/bronze"
+          mkdir -p "$DAT535_DATA_DIR/$DAT535_ENV/bronze"
 
           date_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
           [[ "$IN_START_DATE" =~ $date_re ]] || { echo "Invalid start_date"; exit 2; }
@@ -75,8 +90,9 @@ jobs:
           echo "## Historical Backfill Summary" >> $GITHUB_STEP_SUMMARY
           echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${DAT535_ENV} (branch ${{ github.ref_name }}) |" >> $GITHUB_STEP_SUMMARY
           echo "| Run Number | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Range | ${IN_START_DATE} → ${IN_END_DATE} |" >> $GITHUB_STEP_SUMMARY
           echo "| Request Delay | ${IN_REQUEST_DELAY}s |" >> $GITHUB_STEP_SUMMARY
-          echo "| Bronze Directory | $DAT535_DATA_DIR/bronze |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bronze Directory | $DAT535_DATA_DIR/$DAT535_ENV/bronze |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered By | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

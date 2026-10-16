@@ -27,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import BRONZE_DIR
+from config.settings import BRONZE_DIR, DAT535_ENV
 from src.ingestion.frost_client import FrostClient
 from src.ingestion.ingest_daily import (
     EXIT_CONFIG_ERROR,
@@ -84,6 +84,7 @@ def run_backfill(
 
     done = completed_ranges(bronze_dir)
     months = split_by_month(dates)
+    logger.info(f"Environment: {DAT535_ENV} | Bronze: {bronze_dir}")
     logger.info(f"Historical backfill {dates[0]} -> {dates[-1]}: {len(dates)} day(s) in {len(months)} month(s)")
 
     worst = EXIT_OK

@@ -40,7 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import BRONZE_CHAOS_DIR, BRONZE_DIR
+from config.settings import BRONZE_CHAOS_DIR, BRONZE_DIR, DAT535_ENV
 from src.ingestion.bronze_writer import BronzeWriter
 from src.utils.hashing import generate_batch_id, get_utc_now_iso
 
@@ -252,6 +252,7 @@ def main() -> int:
         logger.error(f"Bronze directory not found: {args.bronze_dir}")
         return 2
 
+    logger.info(f"Environment: {DAT535_ENV} | Bronze: {args.bronze_dir} | Chaos copy: {args.output_dir}")
     run_chaos_injection(args.bronze_dir, args.output_dir, rate=args.rate, seed=args.seed)
     return 0
 
