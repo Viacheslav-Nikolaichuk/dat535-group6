@@ -7,6 +7,7 @@ from datetime import date, timedelta
 import json
 from pathlib import Path
 import random
+from unittest import mock
 
 import pytest
 
@@ -91,14 +92,19 @@ def test_inject_record_errors_rate_zero_returns_identical_copy():
 # Bronze tree mirroring
 # ---------------------------------------------------------------------- #
 def _build_bronze(bronze_dir: Path, n_days: int) -> None:
-    """Write n_days of NO1 prices and SN18700 mock weather with the real BronzeWriter."""
+    """Write n_days of NO1 prices and SN18700 mock weather with the real BronzeWriter.
+
+    The ingestion timestamp is fixed, so the file names, and with them the per-file chaos seeds,
+    are the same on every test run instead of depending on the clock.
+    """
     writer = BronzeWriter(bronze_dir=bronze_dir)
     frost = FrostClient(client_id="")
-    for i in range(n_days):
-        d = (date(2024, 1, 1) + timedelta(days=i)).isoformat()
-        writer.write_electricity_prices("NO1", d, _prices(24), "fake://", "b")
-        weather = frost.fetch_observations(d, "SN18700", allow_mock_fallback=True)["records"]
-        writer.write_weather_observations("SN18700", d, weather, "mock://", "b", is_synthetic=True)
+    with mock.patch("src.ingestion.bronze_writer.get_utc_now_iso", return_value="2026-01-01T00:00:00Z"):
+        for i in range(n_days):
+            d = (date(2024, 1, 1) + timedelta(days=i)).isoformat()
+            writer.write_electricity_prices("NO1", d, _prices(24), "fake://", "b")
+            weather = frost.fetch_observations(d, "SN18700", allow_mock_fallback=True)["records"]
+            writer.write_weather_observations("SN18700", d, weather, "mock://", "b", is_synthetic=True)
     writer.write_manifest({"batch_id": "b"})
 
 

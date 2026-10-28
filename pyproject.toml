@@ -4,3 +4,8 @@
 # is never collected.
 pythonpath = ["."]
 testpaths = ["tests"]
+# Spark tests start a local SparkSession (need Java + pyspark). CI runs everything; the VM runs
+# `pytest -m "not spark"` before ingesting so a Bronze run is not slowed down by Spark start-up.
+markers = [
+    "spark: starts a local SparkSession; skipped when pyspark is not installed",
+]
