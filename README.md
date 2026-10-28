@@ -46,7 +46,10 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   ├── project_cicd_guide.md
 │   └── workflows/                         # Disabled lab workflows (dat535-dev, dat535-prod, pipeline)
 ├── docs/                                  # Project guides & documentation
-│   └── Data_Engineering_Project_Definition_Guide_v3.pdf
+│   ├── Data_Engineering_Project_Definition_Guide_v3.pdf
+│   └── plans/
+│       ├── silver_layer.md                # Proposed Silver layer (tables Gold reads, cleaning rules, quality evidence)
+│       └── use_cases.md                   # Proposed Gold use cases (dashboard, application, report, ML model)
 ├── dat535_data_engineering_project_definition.md # Official project specification & architecture
 ├── pyproject.toml                         # Pytest configuration (import path, test discovery)
 ├── requirements.txt                       # Project Python dependencies
@@ -82,8 +85,8 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
   * **Tamper evidence**: `_metadata` is copied unchanged, so a modified payload no longer matches its `_payload_checksum`.
   * **Ground truth**: every run writes `/bronze_chaos/_manifests/run__{batch_id}.json` with the rate, seed, counts per error type, and every injected error (`file`, `type`, record `index`, `field`, `original` value). The data files carry no markers, so Silver must detect errors itself; its DLQ/dedup counts can then be scored against the union of these manifests.
   * **Reproducible & incremental**: each file's errors are seeded from `(seed, relative path)`, so daily runs and historical backfills damage a file identically. Files already in `/bronze_chaos/` are skipped; delete the folder to rebuild with a different `--rate`/`--seed`.
-* **Silver Layer** *(Upcoming)*: Strongly typed PySpark schema enforcement, UTC timezone harmonization, deduplication window functions, forward-fill gap imputation, Heating Degree Hours (HDH) calculation, and DLQ quarantine.
-* **Gold Layer** *(Upcoming)*: Serving assets for regional grid economics and price sensitivity features.
+* **Silver Layer** *(Upcoming)*: Strongly typed PySpark schema enforcement, UTC timezone harmonization, deduplication window functions, forward-fill gap imputation, Heating Degree Hours (HDH) calculation, and DLQ quarantine. Proposed design: [docs/plans/silver_layer.md](docs/plans/silver_layer.md).
+* **Gold Layer** *(Upcoming)*: Serving assets for regional grid economics and price sensitivity features. Proposed use cases: [docs/plans/use_cases.md](docs/plans/use_cases.md).
 
 ---
 
