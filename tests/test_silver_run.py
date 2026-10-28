@@ -11,8 +11,6 @@ import pytest
 
 pytest.importorskip("pyspark")
 
-from pyspark.sql import functions as F  # noqa: E402
-
 from config.settings import PRICE_ZONES  # noqa: E402
 from conftest import BronzeFactory, weather_records  # noqa: E402
 from src.ingestion.chaos_injector import run_chaos_injection  # noqa: E402
