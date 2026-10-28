@@ -1,8 +1,8 @@
 name: Data Pipeline
 
-# Medallion pipeline on the self-hosted runner. Each layer is a job;
-# Silver and Gold will be added as jobs with `needs:` on the previous layer so they
-# only run after it succeeds and can be re-run individually.
+# Medallion pipeline on the self-hosted runner. Each layer is a job with `needs:` on the
+# previous one, so it only runs after that succeeds and can be re-run individually:
+# bronze -> bronze_chaos -> silver (Gold will follow the same pattern).
 #
 # Environment follows the branch: runs from main write to <data root>/prod (the cron
 # schedule only fires on main), manual runs from dev write to <data root>/dev.
@@ -80,10 +80,11 @@ jobs:
           source ~/spark-env/bin/activate
           pip install -r requirements.txt
 
+      # Spark tests run in CI; skipping them here keeps a SparkSession start-up out of every ingestion.
       - name: Run unit tests
         run: |
           source ~/spark-env/bin/activate
-          pytest -q
+          pytest -q -m "not spark"
 
       - name: Run Bronze Ingestion
         run: |
@@ -163,3 +164,38 @@ jobs:
           source ~/spark-env/bin/activate
           # Only Bronze files not yet in bronze_chaos/ are processed (default 1% rate, seed 42).
           python src/ingestion/chaos_injector.py
+
+  silver:
+    name: Silver Layer
+    # Skipped whenever bronze_chaos is (dry runs): there is nothing new to clean.
+    needs: bronze_chaos
+    runs-on: self-hosted
+    timeout-minutes: 60
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+    env:
+      DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+
+    steps:
+      # main writes prod, dev writes dev; any other branch is refused before touching data.
+      - name: Guard branch
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|dev) ;;
+            *) echo "::error::Data workflows only run from main (prod) or dev (dev), not '$GITHUB_REF_NAME'"; exit 1 ;;
+          esac
+          if [ "$DAT535_ENV" = "prod" ] && [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Only main may write to prod"; exit 1
+          fi
+          echo "Environment: $DAT535_ENV -> $DAT535_DATA_DIR/$DAT535_ENV"
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Build Silver tables
+        run: |
+          set -euo pipefail
+          source ~/spark-env/bin/activate
+          # Rebuilds every Silver table from bronze_chaos/ (SILVER_INPUT) and writes the step summary.
+          # Exit code 1 = a hard check failed and nothing was written (the previous Silver stays).
+          python src/silver/run_silver.py

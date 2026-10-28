@@ -1,6 +1,6 @@
 # Silver layer
 
-**Status:** proposal for the team to discuss. Nothing here is built yet.
+**Status:** built on branch `feat/silver-layer` (28 Oct 2026) and tested in CI-like conditions; not yet run on the VM. Section 12 shows what is left.
 
 **Data:** two sources only: electricity prices (hvakosterstrommen.no) and weather (MET Frost). The Gold use cases in [use_cases.md](use_cases.md) are built on the tables in section 4.
 
@@ -65,7 +65,7 @@ Every injected error is listed in `bronze_chaos/_manifests/`, so we can check wh
 
 Conventions for every table:
 - **Location:** `<data root>/<env>/silver/<table>/`.
-- **Partitions:** `year` and `month` of the Norwegian date. The two small reference tables are single files; `dq_issues` is split by source.
+- **Partitions:** `year` and `month` of the Norwegian date, one file per month. The two reference tables and `dq_issues` (thousands of rows at most, even on the chaos copy) are single files.
 - **Time:** `utc_hour` is the start of the hour in UTC. Anyone reading Silver must set `spark.sql.session.timeZone=UTC`, or the times display shifted.
 - **Units** are part of the column names. Prices exclude VAT.
 - **Lineage:** `prices` and `weather_hourly` keep `_source_file`, `_batch_id` and `_ingested_at_utc`, so every row can be traced back to its Bronze file.
@@ -86,7 +86,7 @@ There is also one run manifest per run, `_runs/run__<run_id>.json`. It holds the
 - from the first price hour (2021-11-01, if prod history goes back that far);
 - to the last one (tomorrow, once the day-ahead run exists).
 
-The row exists even when a source has no data. `has_price` and `has_weather` say what is there.
+The row exists even when a source has no data. `has_price` and `has_weather` say what is there; `has_weather` means the zone has a temperature for that hour.
 
 **Example** (real data):
 - **Bronze:**
@@ -184,7 +184,7 @@ Why this split:
 2. **Zone weather.**
    - Each station gets its zone from `dim_station`. This is a broadcast join: the small table is copied to every worker, so the big table isn't shuffled.
    - For each zone and hour, we take the mean temperature and wind of its stations. NO2 averages Kjevik and Sola.
-   - `station_count` says how many stations had data.
+   - `station_count` says how many stations had a temperature.
 3. **Heating degree hours.** `hdh = max(0, 17 − temp_celsius)`, as in the project definition.
 4. **Left joins.** Prices and zone weather are left-joined onto the grid. The project definition has an inner join, which would drop tomorrow's prices because they have no weather yet. With the grid, every price hour stays and every gap is visible.
 5. **Norwegian time and calendar.** `local_date` and `local_hour` come from `from_utc_timestamp(utc_hour, 'Europe/Oslo')`. `weekday`, `is_weekend` and `is_holiday` come from `dim_date`.
@@ -240,7 +240,7 @@ The chaos injector writes down every error it makes. We match Silver's issue log
 | Truncated file | `rejected`; the older version is used if there is one | Same |
 
 - **Target: 100% found** for every error type. That is possible because Silver checks every file and every series (D7).
-- **Health page:** the share found per type and the number of problems that are not on the chaos list go into `dq_metrics` (`chaos_recall_<type>`, `unexplained_issues`).
+- **Health page:** the share found per type and the number of problems that are not on the chaos list go into `dq_metrics` (source `chaos`: `recall_<type>`, `unexplained_issues`) and the run manifest.
 - **Clean baseline (once, for the report):** run Silver on clean Bronze into a scratch folder (`--input bronze --output-dir ...`). It should find almost nothing, and the repaired prices from the chaos run should equal the clean prices.
 
 ## 10. Performance: measure, then decide
@@ -272,7 +272,7 @@ The guide asks for tuning "supported by relevant evidence rather than optimizati
 
 **What we reuse from Bronze:**
 - `BronzeWriter`, for test data and atomic manifest writes;
-- `load_stations_config`;
+- the zones file `config/zones_and_stations.json` (read directly, because `load_stations_config` returns only station IDs);
 - the chaos injector;
 - `generate_batch_id`;
 - the paths in `config/settings.py`, plus one new setting: `SILVER_INPUT`, default `bronze_chaos`.
@@ -301,28 +301,31 @@ The guide asks for tuning "supported by relevant evidence rather than optimizati
 
 ## 12. Build order
 
-One pull request per step.
+One commit per step on `feat/silver-layer`. ✅ = done and covered by tests; ⏳ = still to do.
 
 **Must**
 
-0. **Backfill prod history.** Checked 28 Oct 2026: prod Bronze has no history yet, because the backfill hasn't been run. Run **Actions → Historical Backfill** on `main`:
+0. ⏳ **Backfill prod history.** Checked 28 Oct 2026: prod Bronze has no history yet, because the backfill hasn't been run. Run **Actions → Historical Backfill** on `main`:
    - start at 2021-11-01, the first day with prices for all five zones (NO4 has none in October 2021);
    - first 2021-11-01 → 2021-12-31 as a short test, then one calendar year per run, then 2026 up to today minus 4 days;
    - about an hour per year; start runs during the day, so the VM's runner is free for the 02:00 UTC daily run.
 
    The next daily run then copies the history into `bronze_chaos/` by itself. Silver's code and tests don't wait for this; only the first full prod run does.
-1. **Spark runtime:** pin pyspark, run CI on Python 3.11 and Java 8, add the `spark` test marker and fixture and `spark_session.py`. Bring over the chaos-test fix.
-2. Reading Bronze, the issue log, `dim_station` and `dim_date`.
-3. `prices`, with the daylight saving tests.
-4. `weather_hourly`: series choice and gap filling.
-5. `zone_hourly`.
-6. Checks, scorecard, chaos score and run manifest.
-7. **Workflow job.** First a full run on dev, then on prod, then the one-off run on clean Bronze.
+1. ✅ **Spark runtime:** pin pyspark, run CI on Python 3.11 and Java 8, add the `spark` test marker and fixture and `spark_session.py`. Bring over the chaos-test fix.
+2. ✅ Reading Bronze, the issue log, `dim_station` and `dim_date`.
+3. ✅ `prices`, with the daylight saving tests.
+4. ✅ `weather_hourly`: series choice and gap filling.
+5. ✅ `zone_hourly`.
+6. ✅ Checks, scorecard, chaos score and run manifest.
+7. **Workflow job.**
+   - ✅ The `silver` job runs after `bronze_chaos` in `pipeline.yml`; the VM runs the tests without Spark.
+   - ⏳ Merge into `dev` and do a first full run on the VM (dev environment).
+   - ⏳ After the backfill, a run on prod, then the one-off run on clean Bronze.
 
 **Should**
 
-8. Performance experiments (section 10), notes for the report, and the README and project definition updates (section 14).
-9. `--months`, only if step 8 shows that the full rebuild is too slow for the 14:30 deadline.
+8. ⏳ Performance experiments (section 10), notes for the report, and the project definition updates (section 14). The README is already updated.
+9. ⏳ `--months`, only if step 8 shows that the full rebuild is too slow for the 14:30 deadline.
 
 ## 13. The guide's Silver questions
 
@@ -356,11 +359,18 @@ One pull request per step.
 
 ## 15. Done when
 
-- A full prod run passes all hard checks, with 0 duplicate keys in every table.
-- Daylight saving days have 23 or 25 hours in `prices` and `zone_hourly`.
-- 100% of the injected chaos errors are found, and the repaired prices equal the clean ones.
-- Every run writes a run manifest and scorecard rows, and the step summary shows them.
-- The time of a full rebuild is measured and written down.
+- ⏳ A full prod run passes all hard checks, with 0 duplicate keys in every table.
+- ✅ Daylight saving days have 23 or 25 hours in `prices` and `zone_hourly`.
+- ✅ 100% of the injected chaos errors are found, and the repaired prices equal the clean ones. ⏳ Still to confirm on prod data.
+- ✅ Every run writes a run manifest and scorecard rows, and the step summary shows them.
+- ⏳ The time of a full rebuild is measured and written down.
+
+**Tested so far** (28 Oct 2026, in a Linux container with Python 3.11, Java 17 and Spark 3.5.0):
+- All 88 tests pass, 30 of them Spark tests.
+- A smoke run of the real command lines on a week of generated Bronze around the October DST change:
+  - 71 files, 65 injected errors: **all 65 found**, and no issue that isn't on the chaos list;
+  - `zone_hourly` has exactly 5 zones × 169 hours;
+  - one truncated price file shows up as a soft warning (one incomplete zone-day), as intended.
 
 ## 16. Answered questions
 
