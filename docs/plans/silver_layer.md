@@ -123,7 +123,7 @@ Notes for whoever builds it:
 | Check | Rule | If it fails |
 |---|---|---|
 | Timestamp | `time_start` is read with its offset and converted to UTC (`try_to_timestamp`). | Use `time_end` minus one hour (`repaired`). If that fails too: `rejected`. |
-| Hourly | `time_end` − `time_start` is one hour. | `rejected` (`wrong_resolution`). This protects us if the API ever switches to 15-minute prices. |
+| Hourly | `time_end` is readable, `time_end` − `time_start` is one hour, and the hour is whole. | `rejected` (`wrong_resolution`). A price whose duration can't be checked counts as a wrong one. This also protects us if the API ever switches to 15-minute prices. |
 | Right day | The Norwegian date of the hour matches the file's date. | `rejected` (`wrong_day`) |
 | Price | `NOK_per_kWh` is not null and lies between −15 and 20. | Rebuild it as EUR × EXR, rounded to 5 decimals (`repaired`). If EUR or EXR is unusable: `rejected`. |
 | Duplicate | The same hour appears twice in one file. | The later copy is `removed`. |
@@ -377,7 +377,7 @@ One commit per step on `feat/silver-layer`. ✅ = done and covered by tests; ⏳
 - ⏳ The time of a full rebuild is measured and written down.
 
 **Tested so far** (28 Oct 2026, in a Linux container with Python 3.11, Java 17 and Spark 3.5.0):
-- All 88 tests pass, 30 of them Spark tests.
+- All 92 tests pass, 34 of them Spark tests. This includes the fixes from Copilot's review of PR #7: no empty or mostly rejected publishes, staged writes, and an unreadable `time_end`.
 - A smoke run of the real command lines on a week of generated Bronze around the October DST change:
   - 71 files, 65 injected errors: **all 65 found**, and no issue that isn't on the chaos list;
   - `zone_hourly` has exactly 5 zones × 169 hours;

@@ -3,7 +3,8 @@ Cleans Bronze day-ahead prices into `silver/prices`: one row per bidding zone an
 
 Rules (docs/plans/silver_layer.md, section 6), checked in this order:
     timestamp  time_start (with its UTC offset) -> UTC; if unreadable, time_end - 1 h (repaired)
-    hourly     time_end - time_start is one hour and the hour is whole, else rejected
+    hourly     time_end is readable, time_end - time_start is one hour and the hour is whole,
+               else rejected
     right day  the Norwegian date of the hour is the file's date, else rejected
     duplicate  the same hour again in one file: the later copy is removed
     price      NOK/kWh present and within [-15, 20]; otherwise rebuilt as EUR x EXR (repaired),
@@ -67,10 +68,13 @@ def clean_prices(records: DataFrame) -> Tuple[DataFrame, DataFrame, DataFrame]:
     ).withColumn("utc_hour", F.coalesce("ts_start", F.col("ts_end") - F.expr("INTERVAL 1 HOUR")))
 
     placed = F.col("utc_hour").isNotNull()
+    # A price whose duration can't be checked (unreadable time_end) counts as a wrong one. The
+    # whole-hour check also covers hours rebuilt from time_end, where there is no duration to check.
     rows = rows.withColumn(
         "bad_resolution",
-        placed & _flag(
-            (F.col("ts_end").cast("long") - F.col("ts_start").cast("long") != 3600)
+        placed & (
+            F.col("ts_end").isNull()
+            | _flag(F.col("ts_end").cast("long") - F.col("ts_start").cast("long") != 3600)
             | (F.date_trunc("hour", "utc_hour") != F.col("utc_hour"))
         ),
     ).withColumn(

@@ -96,6 +96,23 @@ def test_rows_that_cannot_be_repaired_are_rejected(spark, bronze):
     assert checked.filter(F.col("status") == "rejected").count() == 4
 
 
+def test_prices_whose_duration_cannot_be_checked_are_rejected(spark, bronze):
+    records = price_records("2024-01-15")
+    records[4]["time_end"] = "not-a-timestamp"  # start is fine, but the duration is unknown
+    records[6]["time_start"] = "not-a-timestamp"
+    records[6]["time_end"] = "2024-01-15T07:30:00+01:00"  # rebuilt start 06:30 is not a whole hour
+    bronze.prices("NO1", "2024-01-15", records)
+
+    table, issues, _ = _clean(spark, bronze)
+
+    assert _issues(issues) == {
+        ("wrong_resolution", "rejected", 4, "time_end"),
+        ("bad_timestamp", "repaired", 6, "time_start"),  # rebuilt from time_end ...
+        ("wrong_resolution", "rejected", 6, "time_end"),  # ... but the result is not a whole hour
+    }
+    assert table.count() == 22
+
+
 def test_superseded_versions_are_checked_but_not_used(spark, bronze):
     old = price_records("2024-01-15", exr=11.0)
     old[0]["NOK_per_kWh"] = None
