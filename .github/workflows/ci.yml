@@ -24,11 +24,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      # Python 3.11 and Java 8 match the VM runner (Spark 3.5.0), so the Spark tests here
+      # exercise the same versions as production.
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: pip
+
+      - name: Set up Java (for PySpark)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '8'
 
       - name: Install dependencies
         run: pip install -r requirements.txt

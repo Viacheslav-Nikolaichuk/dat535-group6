@@ -73,6 +73,14 @@ BRONZE_CHAOS_DIR = DATA_DIR / "bronze_chaos"  # Bronze copy with injected errors
 SILVER_DIR = DATA_DIR / "silver"
 GOLD_DIR = DATA_DIR / "gold"
 
+# Which Bronze tree Silver cleans. The chaos copy is the default, so cleaning is exercised and
+# scored on every run; "bronze" gives the clean baseline (docs/plans/silver_layer.md, D1).
+SILVER_INPUTS = ("bronze_chaos", "bronze")
+SILVER_INPUT = os.environ.get("SILVER_INPUT", "bronze_chaos").strip().lower()
+
+# First day with day-ahead prices for all five zones (NO4 has none in October 2021).
+HISTORY_START = "2021-11-01"
+
 # MET Norway Frost API Configuration
 FROST_BASE_URL = os.environ.get("FROST_BASE_URL", "https://frost.met.no")
 FROST_CLIENT_ID = (
