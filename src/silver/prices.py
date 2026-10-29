@@ -3,9 +3,10 @@ Cleans Bronze day-ahead prices into `silver/prices`: one row per bidding zone an
 
 Rules (docs/plans/silver_layer.md, section 6), checked in this order:
     timestamp  time_start (with its UTC offset) -> UTC; if unreadable, time_end - 1 h (repaired)
-    hourly     time_end is readable, time_end - time_start is one hour and the hour is whole,
-               else rejected
-    right day  the Norwegian date of the hour is the file's date, else rejected
+    hourly     time_end is readable, time_end - time_start is one hour (in UTC or on the Norwegian
+               clock) and the hour is whole, else rejected
+    right day  the Norwegian date of the hour is the file's date, else rejected; the file's other
+               rows are rejected too, because its labels are shifted
     duplicate  the same hour again in one file: the later copy is removed
     price      NOK/kWh present and within [-15, 20]; otherwise rebuilt as EUR x EXR (repaired),
                or rejected if EUR or EXR is unusable too
@@ -68,20 +69,35 @@ def clean_prices(records: DataFrame) -> Tuple[DataFrame, DataFrame, DataFrame]:
     ).withColumn("utc_hour", F.coalesce("ts_start", F.col("ts_end") - F.expr("INTERVAL 1 HOUR")))
 
     placed = F.col("utc_hour").isNotNull()
+    utc_seconds = F.col("ts_end").cast("long") - F.col("ts_start").cast("long")
+    local_seconds = (
+        F.from_utc_timestamp("ts_end", OSLO_TZ).cast("long") - F.from_utc_timestamp("ts_start", OSLO_TZ).cast("long")
+    )
     # A price whose duration can't be checked (unreadable time_end) counts as a wrong one. The
     # whole-hour check also covers hours rebuilt from time_end, where there is no duration to check.
+    # One hour on the Norwegian clock also counts: on the autumn DST days of 2022-2025 the API ends
+    # the first 02:00 hour at 03:00+01:00, which is two hours later in UTC.
     rows = rows.withColumn(
         "bad_resolution",
         placed & (
             F.col("ts_end").isNull()
-            | _flag(F.col("ts_end").cast("long") - F.col("ts_start").cast("long") != 3600)
+            | _flag((utc_seconds != 3600) & (local_seconds != 3600))
             | (F.date_trunc("hour", "utc_hour") != F.col("utc_hour"))
         ),
     ).withColumn(
         "wrong_day",
         placed & ~F.col("bad_resolution")
         & _flag(F.to_date(F.from_utc_timestamp("utc_hour", OSLO_TZ)) != F.col("file_date")),
-    ).withColumn("in_place", placed & ~F.col("bad_resolution") & ~F.col("wrong_day"))
+    )
+    # A file with an hour of another day has shifted labels: the API's 2024-10-27 files for NO1, NO3,
+    # NO4 and NO5 skip the second 02:00 and end at 00:00 the next day. None of its hours can be trusted.
+    rows = rows.withColumn(
+        "untrusted_file",
+        placed & ~F.col("bad_resolution") & ~F.col("wrong_day")
+        & F.max("wrong_day").over(Window.partitionBy("source_file")),
+    ).withColumn(
+        "in_place", placed & ~F.col("bad_resolution") & ~F.col("wrong_day") & ~F.col("untrusted_file")
+    )
 
     # The first copy of an hour in a file wins; rows that are not in place never compete.
     first_copy = Window.partitionBy("source_file", "in_place", "utc_hour").orderBy("record_index")
@@ -107,6 +123,7 @@ def clean_prices(records: DataFrame) -> Tuple[DataFrame, DataFrame, DataFrame]:
             ),
             issue_if(F.col("bad_resolution"), "wrong_resolution", ACTION_REJECTED, "time_end"),
             issue_if(F.col("wrong_day"), "wrong_day", ACTION_REJECTED, "time_start"),
+            issue_if(F.col("untrusted_file"), "untrusted_file", ACTION_REJECTED, "time_start"),
             issue_if(F.col("duplicate"), "duplicate", ACTION_REMOVED),
             issue_if(price_problem & F.col("nok").isNull(), "null_value", price_action, "NOK_per_kWh"),
             issue_if(price_problem & F.col("nok").isNotNull(), "out_of_range", price_action, "NOK_per_kWh"),

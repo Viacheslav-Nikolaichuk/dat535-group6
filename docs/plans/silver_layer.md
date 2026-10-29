@@ -123,12 +123,16 @@ Notes for whoever builds it:
 | Check | Rule | If it fails |
 |---|---|---|
 | Timestamp | `time_start` is read with its offset and converted to UTC (`try_to_timestamp`). | Use `time_end` minus one hour (`repaired`). If that fails too: `rejected`. |
-| Hourly | `time_end` is readable, `time_end` − `time_start` is one hour, and the hour is whole. | `rejected` (`wrong_resolution`). A price whose duration can't be checked counts as a wrong one. This also protects us if the API ever switches to 15-minute prices. |
-| Right day | The Norwegian date of the hour matches the file's date. | `rejected` (`wrong_day`) |
+| Hourly | `time_end` is readable, `time_end` − `time_start` is one hour (in UTC or on the Norwegian clock), and the hour is whole. | `rejected` (`wrong_resolution`). A price whose duration can't be checked counts as a wrong one. This also protects us if the API ever switches to 15-minute prices. |
+| Right day | The Norwegian date of the hour matches the file's date. | `rejected` (`wrong_day`). The file's other rows are `rejected` too (`untrusted_file`): its labels are shifted. |
 | Price | `NOK_per_kWh` is not null and lies between −15 and 20. | Rebuild it as EUR × EXR, rounded to 5 decimals (`repaired`). If EUR or EXR is unusable: `rejected`. |
 | Duplicate | The same hour appears twice in one file. | The later copy is `removed`. |
 
 `is_repaired` marks rows whose price or time was rebuilt. As an extra check, we count the rows where NOK and EUR × EXR differ by more than 0.001. We expect none.
+
+**Two API faults on autumn DST days**, found by the first prod run (29 Oct 2026). Both are behind the two extra rules above.
+- **2022–2025, every zone:** the first 02:00 hour ends at `03:00+01:00` instead of `02:00+01:00`, so in UTC it looks two hours long. The start and the price are right, so the hourly check also accepts one hour on the Norwegian clock. 2026 is labelled correctly.
+- **2024-10-27 for NO1, NO3, NO4 and NO5:** the file skips the second 02:00 and ends with 00:00 on 28 October. That hour's price differs from the one in the 28 October file (NO1: 0.19408 vs 0.12056 NOK/kWh), so every label after the clock change is one hour late. Silver rejects these files whole, and those four zone-days are missing.
 
 ## 7. Cleaning weather → `weather_hourly`
 
@@ -316,7 +320,7 @@ One commit per step on `feat/silver-layer`. ✅ = done and covered by tests; ⏳
 
 **Must**
 
-0. ⏳ **Backfill prod history.** Checked 28 Oct 2026: prod Bronze has no history yet, because the backfill hasn't been run. Run **Actions → Historical Backfill** on `main`:
+0. ✅ **Backfill prod history.** Done 29 Oct 2026: prod Bronze goes back to 2021-11-01. It was run with **Actions → Historical Backfill** on `main`:
    - start at 2021-11-01, the first day with prices for all five zones (NO4 has none in October 2021);
    - first 2021-11-01 → 2021-12-31 as a short test, then one calendar year per run, then 2026 up to today minus 4 days;
    - about an hour per year; start runs during the day, so the VM's runner is free for the 02:00 UTC daily run.
@@ -330,13 +334,14 @@ One commit per step on `feat/silver-layer`. ✅ = done and covered by tests; ⏳
 6. ✅ Checks, scorecard, chaos score and run manifest.
 7. **Workflow job.**
    - ✅ The `silver` job runs after `bronze_chaos` in `pipeline.yml`; the VM runs the tests without Spark.
-   - ⏳ Merge into `dev` and do a first full run on the VM (dev environment).
-   - ⏳ After the backfill, a run on prod, then the one-off run on clean Bronze.
+   - ✅ Merged into `dev`; the first run on the VM (dev, 150 days) passed in 37 s.
+   - ✅ After the backfill, a run on prod: all hard checks passed in 62 s over 5 years (section 15).
+   - ⏳ The one-off run on clean Bronze.
 
 **Should**
 
 8. ⏳ Performance experiments (section 10), notes for the report, and the project definition updates (section 14). The README is already updated.
-9. ⏳ `--months`, only if step 8 shows that the full rebuild is too slow for the 14:30 deadline.
+9. ❌ `--months`: not needed, because a full rebuild of 5 years takes about a minute (section 15).
 
 ## 13. The guide's Silver questions
 
@@ -370,14 +375,20 @@ One commit per step on `feat/silver-layer`. ✅ = done and covered by tests; ⏳
 
 ## 15. Done when
 
-- ⏳ A full prod run passes all hard checks, with 0 duplicate keys in every table.
+- ✅ A full prod run passes all hard checks, with 0 duplicate keys in every table.
 - ✅ Daylight saving days have 23 or 25 hours in `prices` and `zone_hourly`.
-- ✅ 100% of the injected chaos errors are found, and the repaired prices equal the clean ones. ⏳ Still to confirm on prod data.
+- ✅ 100% of the injected chaos errors are found, and the repaired prices equal the clean ones. On prod: 3,898 of 3,898 found.
 - ✅ Every run writes a run manifest and scorecard rows, and the step summary shows them.
-- ⏳ The time of a full rebuild is measured and written down.
+- ✅ The time of a full rebuild is measured and written down: 62 s on the VM for 5 years (2021-11-01 to 2026-10-28), against 37 s for 150 days on dev. Most of it is fixed cost, so step 9 (`--months`) isn't needed.
+
+**First prod run** (Data Pipeline #20, 29 Oct 2026, before the DST fix in section 6):
+- 218,184 price rows, 261,210 station-hours and 218,760 `zone_hourly` rows (5 zones × 43,752 hours).
+- 2,895 issues aren't on the chaos list, all of types that chaos never injects:
+  - 2,871 `bad_quality`: Frost flagged them. They cluster in a few station-years: Sola 2022 (1,127), Bergen 2025 (485), Sola 2024 (379), Tromsø 2024 (244).
+  - 20 `wrong_resolution` and 4 `wrong_day`: the two API faults in section 6.
 
 **Tested so far** (28 Oct 2026, in a Linux container with Python 3.11, Java 17 and Spark 3.5.0):
-- All 92 tests pass, 34 of them Spark tests. This includes the fixes from Copilot's review of PR #7: no empty or mostly rejected publishes, staged writes, and an unreadable `time_end`.
+- All 94 tests pass, 36 of them Spark tests. This includes the fixes from Copilot's review of PR #7: no empty or mostly rejected publishes, staged writes, and an unreadable `time_end`.
 - A smoke run of the real command lines on a week of generated Bronze around the October DST change:
   - 71 files, 65 injected errors: **all 65 found**, and no issue that isn't on the chaos list;
   - `zone_hourly` has exactly 5 zones × 169 hours;
@@ -386,4 +397,4 @@ One commit per step on `feat/silver-layer`. ✅ = done and covered by tests; ⏳
 ## 16. Answered questions
 
 1. **Should Silver reject weather values by Frost quality code?** Yes: codes 5, 6 and 7 (D10, section 7).
-2. **How far back does prod Bronze go?** Not back to 2021 yet: the backfill hasn't been run (step 0). This also answers question 3 in [use_cases.md](use_cases.md).
+2. **How far back does prod Bronze go?** To 2021-11-01, since the backfill on 29 Oct 2026 (step 0). This also answers question 3 in [use_cases.md](use_cases.md).
