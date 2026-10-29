@@ -213,6 +213,10 @@ Silver computes all tables first, then checks them, and writes only if the hard 
 | No empty keys; every `utc_hour` is on the full hour | Weather is less than 99% complete for a zone |
 | All values inside the limits after cleaning | More than 5% of a source's rows are rejected (the chaos rate is 1%) |
 | `zone_hourly` has exactly zones × hours rows | NOK and EUR × EXR differ by more than 0.001 |
+| `prices` and `weather_hourly` are not empty | |
+| At most half of a source's records are rejected | |
+
+The last two hard checks protect against a broken input, such as an empty `bronze_chaos/` or a renamed API field. Without them, empty tables would pass every other check and replace the good Silver.
 
 ### 9.2 Before-and-after scorecard
 
@@ -340,7 +344,7 @@ One commit per step on `feat/silver-layer`. ✅ = done and covered by tests; ⏳
 | Implementation | D4; section 11 |
 | Performance | Section 10 |
 | Lifecycle | Sections 11 and 12 |
-| Scalability | D2 and D3: month partitions allow partial rebuilds. Fixed schemas ignore new fields, and a removed field turns into empty values that fail the checks loudly. |
+| Scalability | D2 and D3: month partitions allow partial rebuilds. Fixed schemas ignore new fields. A removed field turns into empty values, the records fail, and a run that loses most of a source's records stops before writing (section 9.1). |
 
 ## 14. Updates to the project definition (in step 8)
 

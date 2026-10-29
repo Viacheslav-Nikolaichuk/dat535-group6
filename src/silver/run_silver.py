@@ -182,8 +182,12 @@ def run_silver(
 
     # 4. Checks, scorecard and chaos score, all before anything is written.
     records_checked = {price_rules.SOURCE: price_checked.count(), weather_rules.SOURCE: weather_checked.count()}
+    records_rejected = {
+        price_rules.SOURCE: price_checked.filter(F.col("status") == price_rules.STATUS_REJECTED).count(),
+        weather_rules.SOURCE: weather_checked.filter(F.col("status") == weather_rules.STATUS_REJECTED).count(),
+    }
     checks = run_checks(
-        prices, weather_hourly, zone_hourly, dim_date, PRICE_ZONES, issues, records_checked,
+        prices, weather_hourly, zone_hourly, dim_date, PRICE_ZONES, issues, records_checked, records_rejected,
         nok_eur_mismatches=price_checked.filter(F.col("nok_eur_mismatch")).count(),
         price_bounds=(price_rules.PRICE_MIN_NOK, price_rules.PRICE_MAX_NOK),
         temp_bounds=(weather_rules.TEMP_MIN_C, weather_rules.TEMP_MAX_C),

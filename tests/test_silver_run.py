@@ -12,7 +12,7 @@ import pytest
 pytest.importorskip("pyspark")
 
 from config.settings import PRICE_ZONES  # noqa: E402
-from conftest import BronzeFactory, weather_records  # noqa: E402
+from conftest import BronzeFactory, price_records, weather_records  # noqa: E402
 from src.ingestion.chaos_injector import run_chaos_injection  # noqa: E402
 from src.silver import run_silver as silver  # noqa: E402
 
@@ -88,10 +88,41 @@ def test_a_failed_hard_check_writes_nothing(spark, bronze, tmp_path, monkeypatch
     assert [p.name for p in out.iterdir()] == ["_runs"]  # only the manifest, no tables
     [manifest] = _manifests(out)
     assert manifest["status"] == "FAILED"
-    assert {c["name"] for c in manifest["checks"] if c["hard"] and not c["passed"]} == {
-        "zone_hourly.duplicate_keys",
-        "zone_hourly.grid_rows",
-    }
+    assert _failed_hard_checks(manifest) == {"zone_hourly.duplicate_keys", "zone_hourly.grid_rows"}
+
+
+def _failed_hard_checks(manifest):
+    return {c["name"] for c in manifest["checks"] if c["hard"] and not c["passed"]}
+
+
+def test_empty_input_fails_and_keeps_the_previous_silver(spark, bronze, tmp_path):
+    _fill(bronze, ["2024-01-15"])
+    out = tmp_path / "silver"
+    assert silver.run_silver(bronze.root, out, "bronze", spark=spark) == silver.EXIT_OK
+
+    empty = tmp_path / "empty_bronze"
+    empty.mkdir()
+    assert silver.run_silver(empty, out, "bronze", spark=spark) == silver.EXIT_CHECKS_FAILED
+
+    assert spark.read.parquet(str(out / "zone_hourly")).count() == 5 * 24  # the previous Silver is untouched
+    [failed] = [m for m in _manifests(out) if m["status"] == "FAILED"]
+    assert _failed_hard_checks(failed) == {"prices.not_empty", "weather_hourly.not_empty"}
+
+
+def test_a_source_that_loses_most_records_fails(spark, bronze, tmp_path):
+    records = price_records("2024-01-15")
+    for r in records[:15]:  # 15 of 24 records cannot be placed in time
+        r["time_start"] = r["time_end"] = "not-a-timestamp"
+    bronze.prices("NO1", "2024-01-15", records)
+    for station in STATIONS:
+        bronze.weather(station, "2024-01-15", weather_records("2024-01-15", station))
+    out = tmp_path / "silver"
+
+    assert silver.run_silver(bronze.root, out, "bronze", spark=spark) == silver.EXIT_CHECKS_FAILED
+
+    [manifest] = _manifests(out)
+    assert _failed_hard_checks(manifest) == {"prices.mostly_rejected"}
+    assert next(c for c in manifest["checks"] if c["name"] == "prices.mostly_rejected")["value"] == 62.5
 
 
 def test_chaos_copy_is_cleaned_and_every_injected_error_found(spark, tmp_path):

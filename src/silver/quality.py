@@ -35,6 +35,9 @@ ACTION_EXCLUDED = "excluded"
 # The original record is kept with each issue, shortened so a bad file can't bloat the log.
 RAW_VALUE_MAX_CHARS = 1000
 
+# A run that rejects more than this share of a source's records fails (the chaos rate is 1%).
+MAX_REJECTED_RECORD_SHARE = 0.5
+
 ISSUE_COLUMNS = ["source", "issue", "action", "source_file", "record_index", "field", "raw_value"]
 
 
@@ -129,6 +132,7 @@ def run_checks(
     zones: Sequence[str],
     issues: DataFrame,
     records_checked: Dict[str, int],
+    records_rejected: Dict[str, int],
     nok_eur_mismatches: int,
     price_bounds: Tuple[float, float],
     temp_bounds: Tuple[float, float],
@@ -144,6 +148,20 @@ def run_checks(
     for table, df in (("weather_hourly", weather_hourly), ("zone_hourly", zone_hourly)):
         checks.append(_bounds_check(f"{table}.temp_bounds", df, "temp_celsius", *temp_bounds, "°C"))
         checks.append(_bounds_check(f"{table}.wind_bounds", df, "wind_speed_mps", *wind_bounds, "m/s"))
+
+    # Empty tables pass every check above, and writing them would erase the previous Silver.
+    for table, df in (("prices", prices), ("weather_hourly", weather_hourly)):
+        n = df.count()
+        checks.append(Check(f"{table}.not_empty", True, n > 0, float(n),
+                            "rows in the table; an empty input or a schema change must not erase Silver"))
+
+    # A source that loses most of its records points at a broken input (e.g. a renamed field),
+    # not at bad luck; publishing it would replace good Silver with a fragment.
+    for source, n_records in records_checked.items():
+        share = records_rejected.get(source, 0) / n_records if n_records else 0.0
+        checks.append(Check(f"{source}.mostly_rejected", True, share <= MAX_REJECTED_RECORD_SHARE,
+                            round(100 * share, 3),
+                            f"rejected records per checked record (%), fails above {MAX_REJECTED_RECORD_SHARE:.0%}"))
 
     span_hours = prices.agg(
         ((F.max("utc_hour").cast("long") - F.min("utc_hour").cast("long")) / 3600 + 1).alias("n")
