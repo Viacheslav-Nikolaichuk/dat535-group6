@@ -10,8 +10,8 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 .
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml                         # Unit tests on GitHub-hosted runners (push to dev, PRs to dev/main)
-│       ├── pipeline.yml                   # Medallion pipeline on the VM runner (cron 02:00 UTC on main = prod; manual on dev = dev)
+│       ├── ci.yml                         # All unit tests incl. Spark on GitHub-hosted runners (push to dev, PRs to dev/main)
+│       ├── pipeline.yml                   # Bronze -> chaos copy -> Silver on the VM runner (cron 02:00 UTC on main = prod; manual on dev = dev)
 │       └── backfill.yml                   # Manual historical Bronze backfill on the VM runner (main = prod, dev = dev)
 ├── config/
 │   ├── settings.py                        # dev/prod environment, data paths, env loader, and API base settings
@@ -25,6 +25,15 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   │   ├── ingest_daily.py                # Ingestion entrypoint CLI (daily, lookback catch-up, backfill)
 │   │   └── backfill_historical.py         # Historical backfill CLI: month-by-month, resumable, outside the daily window
 │   │   └── chaos_injector.py              # Builds bronze_chaos/: a Bronze copy with ~1% injected errors
+│   ├── silver/
+│   │   ├── run_silver.py                  # Silver entrypoint CLI: rebuilds every Silver table, checks before writing
+│   │   ├── spark_session.py               # SparkSession factory (UTC, dynamic partition overwrite, AQE)
+│   │   ├── bronze_reader.py               # Explicit Bronze schemas, truncated files, lineage, version choice
+│   │   ├── prices.py                      # Bronze prices -> silver/prices (repairs from EUR x EXR, DST-safe UTC)
+│   │   ├── weather.py                     # Bronze weather -> silver/weather_hourly (series choice, gap filling)
+│   │   ├── zone_hourly.py                 # silver/zone_hourly: every zone x hour, prices + zone weather + HDH
+│   │   ├── reference.py                   # dim_station (config) and dim_date (holidays, hours per local day)
+│   │   └── quality.py                     # Issue log (DLQ), checks, scorecard, chaos score, run manifest
 │   └── utils/
 │       ├── hashing.py                     # Batch UUID4, ISO-8601 UTC, and SHA-256 payload checksums
 │       └── http.py                        # Shared requests.Session with retry/backoff & User-Agent
@@ -35,6 +44,8 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   └── test_backfill.py                   # PyTest suite for the historical backfill (monthly runs, resume, date guard)
 │   └── test_chaos.py                      # PyTest suite for chaos injection (rates, determinism, Bronze untouched)
 │   └── test_settings.py                   # PyTest suite for dev/prod environment and data path resolution
+│   └── conftest.py                        # Shared fixtures: local SparkSession, Bronze builders shaped like the APIs
+│   └── test_silver_*.py                   # Spark tests (marker `spark`): reader, prices, weather, zone_hourly, end-to-end runs
 ├── labs/                                  # Archived course laboratory materials (Lab 1, 2, 3)
 │   ├── lab1_1_setup_guide.md
 │   ├── lab1_install-spark.sh
@@ -46,7 +57,10 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   ├── project_cicd_guide.md
 │   └── workflows/                         # Disabled lab workflows (dat535-dev, dat535-prod, pipeline)
 ├── docs/                                  # Project guides & documentation
-│   └── Data_Engineering_Project_Definition_Guide_v3.pdf
+│   ├── Data_Engineering_Project_Definition_Guide_v3.pdf
+│   └── plans/
+│       ├── silver_layer.md                # Silver layer design (tables Gold reads, cleaning rules, quality evidence)
+│       └── use_cases.md                   # Proposed Gold use cases (dashboard, application, report, ML model)
 ├── dat535_data_engineering_project_definition.md # Official project specification & architecture
 ├── pyproject.toml                         # Pytest configuration (import path, test discovery)
 ├── requirements.txt                       # Project Python dependencies
@@ -82,8 +96,8 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
   * **Tamper evidence**: `_metadata` is copied unchanged, so a modified payload no longer matches its `_payload_checksum`.
   * **Ground truth**: every run writes `/bronze_chaos/_manifests/run__{batch_id}.json` with the rate, seed, counts per error type, and every injected error (`file`, `type`, record `index`, `field`, `original` value). The data files carry no markers, so Silver must detect errors itself; its DLQ/dedup counts can then be scored against the union of these manifests.
   * **Reproducible & incremental**: each file's errors are seeded from `(seed, relative path)`, so daily runs and historical backfills damage a file identically. Files already in `/bronze_chaos/` are skipped; delete the folder to rebuild with a different `--rate`/`--seed`.
-* **Silver Layer** *(Upcoming)*: Strongly typed PySpark schema enforcement, UTC timezone harmonization, deduplication window functions, forward-fill gap imputation, Heating Degree Hours (HDH) calculation, and DLQ quarantine.
-* **Gold Layer** *(Upcoming)*: Serving assets for regional grid economics and price sensitivity features.
+* **Silver Layer**: PySpark cleans the chaos copy (by default) into typed, deduplicated UTC tables: `prices`, `weather_hourly` and `zone_hourly` (every zone × hour, the table Gold reads), plus `dim_date`, `dim_station`, the issue log `dq_issues` (DLQ), the scorecard `dq_metrics` and a run manifest. See [Silver Layer](#silver-layer) below and the design in [docs/plans/silver_layer.md](docs/plans/silver_layer.md).
+* **Gold Layer** *(Upcoming)*: Serving assets for regional grid economics and price sensitivity features. Proposed use cases: [docs/plans/use_cases.md](docs/plans/use_cases.md).
 
 ---
 
@@ -126,10 +140,14 @@ python scripts/test_api_connections.py
 Execute the automated test suite:
 
 ```bash
-pytest -v
+pytest -v                    # everything (Spark tests need Java 8/11/17 and pyspark 3.5.0)
+pytest -v -m "not spark"     # without the Spark tests
 ```
 
-The same suite runs automatically in `.github/workflows/ci.yml` on every push to `dev` and every pull request to `dev`/`main`. It uses GitHub-hosted runners, so the self-hosted VM runner is used only for jobs that touch real data.
+The same suite runs automatically in `.github/workflows/ci.yml` on every push to `dev` and every pull request to `dev`/`main`, on Python 3.11 with Java 8 like the VM. It uses GitHub-hosted runners, so the self-hosted VM runner is used only for jobs that touch real data.
+
+* **Spark tests** are marked `spark` and are skipped automatically when `pyspark` is not installed. They start a local SparkSession and build small Bronze trees with the real `BronzeWriter`.
+* **On Windows**, Spark cannot write files without Hadoop's `winutils`, so run the Spark tests in CI, on the VM, in WSL, or in a Linux container (e.g. `python:3.11` with a Java 17 JRE and `pip install -r requirements.txt`).
 
 ---
 
@@ -183,10 +201,10 @@ python src/ingestion/chaos_injector.py --rate 0.02 --seed 7
 
 ### Running on the VM Runner via GitHub Actions
 
-The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It currently has two jobs: `bronze` (ingestion) and `bronze_chaos` (extends `/bronze_chaos/` with the newly ingested files; runs only after `bronze` succeeds and is skipped on dry runs). Silver and Gold will be added as dependent jobs in the same workflow. Runs from `main` write to `prod/`, runs from `dev` to `dev/` (see [Environments](#environments)).
+The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It has three jobs, each starting only after the previous one succeeds: `bronze` (ingestion), `bronze_chaos` (extends `/bronze_chaos/` with the newly ingested files) and `silver` (rebuilds the Silver tables, see [Silver Layer](#silver-layer)). `bronze_chaos` and `silver` are skipped on dry runs. Gold will be added as a dependent job in the same workflow. Runs from `main` write to `prod/`, runs from `dev` to `dev/` (see [Environments](#environments)).
 
 1. **Schedule**: Daily at `02:00 UTC` (cron `0 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main` (prod).
-2. **Quality Gate**: Runs the unit test suite (`pytest -q`) automatically prior to executing ingestion.
+2. **Quality Gate**: Runs the unit test suite without the Spark tests (`pytest -q -m "not spark"`) automatically prior to executing ingestion; CI runs the Spark tests.
 3. **Concurrency & Safety**: Protected by a concurrency lock per branch (`data-pipeline-main`, `data-pipeline-dev`), so two runs never write the same environment at once and dev runs never delay prod. Inputs are checked with strict regexes to prevent shell injection.
 4. **Manual Dispatch**: Go to **Actions** -> **Data Pipeline** -> **Run workflow**, choose the branch (`main` = prod, `dev` = dev):
    - Provide a `target_date` for a single day rerun.
@@ -202,18 +220,50 @@ Make sure `FROST_CLIENT_ID` is saved in your GitHub Repository under **Settings*
 
 `src/ingestion/backfill_historical.py` loads multi-year history into the same `/bronze/` tree without interfering with the daily pipeline. It is a thin wrapper around the daily `run_ingestion()` (unchanged), so files, envelopes, and versioning are identical to daily ingestion.
 
-* **History available**: Strømpris prices start on **2021-10-01**; Frost has data well before that. The project backfills from **2022-01-01** (full calendar years).
+* **History available**: Strømpris prices start on **2021-10-01**, but NO4 only on **2021-11-01**; Frost has data well before that. The project backfills from **2021-11-01**, the first day with prices for all five zones (`HISTORY_START` in `config/settings.py`).
 * **One run per calendar month**: each month gets its own batch ID and run manifest, so a crash or timeout loses at most the current month's manifest.
 * **Resumable**: months that already have a `SUCCESS` manifest are skipped. Rerun the same range after a failure; only unfinished months are requested again, and days already in Bronze are not rewritten (checksum `unchanged`).
 * **Separate from daily runs**: end dates inside the daily 3-day lookback window are refused (latest allowed end date = today − 4 days, UTC), so backfill and daily runs never write the same files. The workflow uses its own concurrency lock per branch (`historical-backfill-main`, `historical-backfill-dev`), so a long backfill never delays the scheduled daily run.
 * **Runtime**: about 9 s per day with the default 0.5 s request delay, i.e. ~1 h per year (~19k files, ~210 MB of Bronze for 2022 → today).
 
 ```bash
-python src/ingestion/backfill_historical.py --start-date 2022-01-01 --end-date 2022-12-31
-python src/ingestion/backfill_historical.py --start-date 2023-01-01 --end-date 2023-12-31 --request-delay 0.2
+python src/ingestion/backfill_historical.py --start-date 2021-11-01 --end-date 2021-12-31
+python src/ingestion/backfill_historical.py --start-date 2022-01-01 --end-date 2022-12-31 --request-delay 0.2
 ```
 
 On the VM runner, use **Actions** -> **Historical Backfill** -> **Run workflow** (`.github/workflows/backfill.yml`, manual only, 6 h timeout) with a `start_date`, `end_date`, and optional `request_delay`. Running one calendar year per run is recommended. Run it from `main` to backfill prod; from `dev` it fills `dev/` (useful for a one-month test).
+
+---
+
+## Silver Layer
+
+`src/silver/run_silver.py` rebuilds every Silver table from the whole input on each run (PySpark 3.5, DataFrame and SQL functions only, no Python UDFs). The design and the reasons behind each rule are in [docs/plans/silver_layer.md](docs/plans/silver_layer.md).
+
+```bash
+# Clean the chaos copy (default: SILVER_INPUT=bronze_chaos) into <data root>/<env>/silver/
+python src/silver/run_silver.py
+
+# Clean baseline: the untouched Bronze into a scratch folder, to compare with the chaos run
+python src/silver/run_silver.py --input bronze --output-dir /tmp/silver_clean
+```
+
+| Table | One row per | Contents |
+|---|---|---|
+| `prices` | zone and UTC hour | Spot price excl. VAT in NOK and EUR, exchange rate, `is_repaired` |
+| `weather_hourly` | station and UTC hour | 2 m temperature, 10 m wind, Frost quality codes, `*_is_imputed` |
+| `zone_hourly` | zone and UTC hour | **The table Gold reads**: every hour, prices + zone weather + `hdh`, Norwegian date and hour, weekday/holiday, `has_price` / `has_weather` |
+| `dim_date` | Norwegian date | Weekday, weekend, public holiday, `hours_in_day` (23/24/25) |
+| `dim_station` | station | Zone, name and coordinates from `config/zones_and_stations.json` |
+| `dq_issues` | problem found | The dead-letter queue: issue, action (`rejected` / `repaired` / `removed` / `excluded`), file, record, field, original record |
+| `dq_metrics` | run and metric | Before/after scorecard and chaos score, appended on every run |
+| `_runs/run__<id>.json` | run | Status, rows, checks, newest price and weather hour per zone |
+
+* **Storage & time**: Parquet, partitioned by `year`/`month` of the Norwegian date, one file per month. `utc_hour` is UTC; readers must set `spark.sql.session.timeZone=UTC`.
+* **Versions**: per zone/station and day, the newest readable, non-empty Bronze file is used; older versions are still checked, so their problems reach the issue log.
+* **Cleaning**: price timestamps are parsed with their UTC offset (DST-safe) and a damaged NOK price is rebuilt as EUR × EXR; weather values that are null, impossible or flagged 5–7 by Frost are rejected, one series per element is used (2 m temperature, 10 m wind), and gaps of 1–2 hours are filled and flagged.
+* **Checks before writing**: no duplicate or empty keys, whole hours, values within bounds, a complete zone × hour grid, non-empty `prices` and `weather_hourly`, and at most half of a source's records rejected. A failed hard check writes nothing and exits with code 1, so Gold keeps the previous Silver. Tables are written to `silver/_staging/` and swapped into place only after every write succeeded, so a crash while writing also leaves the previous Silver intact. Soft checks (incomplete days, weather completeness, rejected share) only warn.
+* **Chaos score**: on the chaos copy, every error listed in `bronze_chaos/_manifests` is matched against `dq_issues`. The share found per error type and the issues not on the chaos list go to the run manifest, `dq_metrics` and the step summary.
+* **Settings**: `SILVER_INPUT` (`bronze_chaos` or `bronze`), `SPARK_DRIVER_MEMORY` (default `2g`), `SPARK_SHUFFLE_PARTITIONS` (default 8).
 
 ---
 
