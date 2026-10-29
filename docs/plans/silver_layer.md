@@ -205,7 +205,14 @@ Why this split:
 
 ### 9.1 Checks before writing
 
-Silver computes all tables first, then checks them, and writes only if the hard checks pass. The run manifest is written last. If a hard check fails, nothing is written, the run exits with code 1, and Gold keeps using the previous Silver.
+Silver computes all tables first, then checks them, and writes only if the hard checks pass. If a hard check fails, nothing is written, the run exits with code 1, and Gold keeps using the previous Silver.
+
+Writing is safe too:
+- every table goes to `silver/_staging/` first;
+- only when all of them are written are they swapped into place, with a few folder renames that take milliseconds;
+- the run manifest is written last.
+
+A crash while writing (a full disk, a killed job) therefore leaves the previous Silver complete.
 
 | Hard checks (stop the run) | Soft checks (warning and metric) |
 |---|---|

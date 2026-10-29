@@ -91,6 +91,33 @@ def test_a_failed_hard_check_writes_nothing(spark, bronze, tmp_path, monkeypatch
     assert _failed_hard_checks(manifest) == {"zone_hourly.duplicate_keys", "zone_hourly.grid_rows"}
 
 
+def test_a_crash_while_writing_keeps_the_previous_silver(spark, bronze, tmp_path, monkeypatch):
+    _fill(bronze, ["2024-01-15"])
+    out = tmp_path / "silver"
+    assert silver.run_silver(bronze.root, out, "bronze", spark=spark) == silver.EXIT_OK
+    _fill(bronze, ["2024-01-16"])  # the next run has two days
+
+    write = silver.write_table
+
+    def disk_full_at_zone_hourly(df, path, partitions):
+        if path.name == "zone_hourly":
+            raise OSError("No space left on device")
+        write(df, path, partitions)
+
+    monkeypatch.setattr(silver, "write_table", disk_full_at_zone_hourly)
+    with pytest.raises(OSError):
+        silver.run_silver(bronze.root, out, "bronze", spark=spark)
+
+    # prices was already rewritten in staging, but the live tables are still the one-day Silver.
+    for table in ("prices", "zone_hourly"):
+        assert spark.read.parquet(str(out / table)).count() == 5 * 24
+
+    monkeypatch.undo()
+    assert silver.run_silver(bronze.root, out, "bronze", spark=spark) == silver.EXIT_OK
+    assert spark.read.parquet(str(out / "zone_hourly")).count() == 5 * 48
+    assert not (out / silver.STAGING_DIR).exists() and not (out / silver.PREVIOUS_DIR).exists()
+
+
 def _failed_hard_checks(manifest):
     return {c["name"] for c in manifest["checks"] if c["hard"] and not c["passed"]}
 

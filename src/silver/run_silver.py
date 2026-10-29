@@ -7,7 +7,8 @@ Every run rebuilds all Silver tables from the whole input (docs/plans/silver_lay
   3. build zone_hourly and the reference tables
   4. run the checks; a failed hard check writes nothing (exit code 1), so Gold keeps reading
      the previous Silver
-  5. write the tables, append the scorecard to dq_metrics, and write the run manifest last
+  5. write every table to silver/_staging/, swap them all into place, append the scorecard to
+     dq_metrics, and write the run manifest last
 
 Tables land in <data root>/<env>/silver/: prices, weather_hourly, zone_hourly, dim_date,
 dim_station, dq_issues, dq_metrics, and _runs/run__<run_id>.json.
@@ -22,6 +23,7 @@ from datetime import date, datetime, timezone
 import logging
 import os
 from pathlib import Path
+import shutil
 import sys
 import time
 from typing import Dict, List, Optional
@@ -87,6 +89,10 @@ TABLE_PARTITIONS = {
     "dq_issues": [],  # small: thousands of rows even on the chaos copy
 }
 
+# A run writes every table here first and swaps them into place only when all writes succeeded.
+STAGING_DIR = "_staging"
+PREVIOUS_DIR = "_previous"
+
 
 def write_table(df: DataFrame, path: Path, partitions: List[str]) -> None:
     """Replace a Silver table. One file per partition: Gold reads few, larger files.
@@ -103,6 +109,25 @@ def write_table(df: DataFrame, path: Path, partitions: List[str]) -> None:
     if partitions:
         writer = writer.partitionBy(*partitions)
     writer.parquet(str(path))
+
+
+def publish(staging: Path, output_dir: Path, names: List[str]) -> None:
+    """Swap the tables written to `staging` into place, after every one of them was written.
+
+    A crash while Spark writes (disk full, a killed job) therefore leaves the live tables
+    untouched. The swap itself is a few directory renames on one filesystem: milliseconds, no
+    Spark. Old tables wait in _previous/ until every table has been swapped.
+    """
+    previous = output_dir / PREVIOUS_DIR
+    shutil.rmtree(previous, ignore_errors=True)
+    previous.mkdir(parents=True)
+    for name in names:
+        live = output_dir / name
+        if live.exists():
+            os.replace(live, previous / name)
+        os.replace(staging / name, live)
+    shutil.rmtree(previous)
+    shutil.rmtree(staging.parent)
 
 
 def _dim_date_range(prices: DataFrame, weather_hourly: DataFrame, today: date):
@@ -144,6 +169,9 @@ def run_silver(
     started_at = get_utc_now_iso()
     today = today or datetime.now(timezone.utc).date()
     spark = spark or get_spark()
+    # Spark matches cached data by query plan, not by file contents: in a reused session a second
+    # run would silently get the first run's cached Bronze instead of the new files.
+    spark.catalog.clearCache()
     input_dir, output_dir = Path(input_dir), Path(output_dir)
 
     logger.info("=" * 65)
@@ -244,9 +272,12 @@ def run_silver(
             logger.error(f"[CHECK FAILED] {c.name}: {c.value:g} ({c.detail})")
         logger.error("Hard checks failed: nothing written, Gold keeps the previous Silver.")
     else:
-        for name, df in tables.items():
-            write_table(df, output_dir / name, TABLE_PARTITIONS[name])
-        write_table(issues, output_dir / "dq_issues", TABLE_PARTITIONS["dq_issues"])
+        published = {**tables, "dq_issues": issues}
+        staging = output_dir / STAGING_DIR / run_id
+        shutil.rmtree(output_dir / STAGING_DIR, ignore_errors=True)  # leftovers of a crashed run
+        for name, df in published.items():
+            write_table(df, staging / name, TABLE_PARTITIONS[name])
+        publish(staging, output_dir, list(published))
         metrics_df = spark.createDataFrame(
             [(run_id, s, m, float(v)) for s, m, v in metrics], "run_id string, source string, metric string, value double"
         ).withColumn("computed_at_utc", detected_at)
