@@ -80,7 +80,6 @@ def test_rows_that_cannot_be_repaired_are_rejected(spark, bronze):
     records = price_records("2024-01-15")
     records[0]["NOK_per_kWh"] = records[0]["EUR_per_kWh"] = None  # nothing to rebuild from
     records[1]["time_start"] = records[1]["time_end"] = "not-a-timestamp"
-    records[2]["time_start"], records[2]["time_end"] = "2024-01-16T02:00:00+01:00", "2024-01-16T03:00:00+01:00"
     records[3]["time_end"] = "2024-01-15T03:30:00+01:00"  # a 30-minute price
     bronze.prices("NO1", "2024-01-15", records)
 
@@ -89,11 +88,37 @@ def test_rows_that_cannot_be_repaired_are_rejected(spark, bronze):
     assert _issues(issues) == {
         ("null_value", "rejected", 0, "NOK_per_kWh"),
         ("bad_timestamp", "rejected", 1, "time_start"),
-        ("wrong_day", "rejected", 2, "time_start"),
         ("wrong_resolution", "rejected", 3, "time_end"),
     }
-    assert table.count() == 20
-    assert checked.filter(F.col("status") == "rejected").count() == 4
+    assert table.count() == 21
+    assert checked.filter(F.col("status") == "rejected").count() == 3
+
+
+def test_the_apis_label_for_the_first_2am_hour_in_autumn_is_accepted(spark, bronze):
+    records = price_records("2024-10-27")
+    records[2]["time_end"] = "2024-10-27T03:00:00+01:00"  # the API in 2022-2025; correct is 02:00+01:00
+    bronze.prices("NO1", "2024-10-27", records)
+
+    table, issues, _ = _clean(spark, bronze)
+
+    assert issues.count() == 0
+    assert table.count() == 25
+
+
+def test_a_file_with_an_hour_of_another_day_is_rejected_whole(spark, bronze):
+    # The API's 2024-10-27 file for NO1: no second 02:00, and the labels run into the next day.
+    records = price_records("2024-10-27")
+    records[2]["time_end"] = "2024-10-27T03:00:00+01:00"
+    bronze.prices("NO1", "2024-10-27", records[:3] + records[4:] + price_records("2024-10-28")[:1])
+    bronze.prices("NO2", "2024-10-27", records)
+
+    table, issues, checked = _clean(spark, bronze)
+
+    assert _issues(issues) == {("wrong_day", "rejected", 24, "time_start")} | {
+        ("untrusted_file", "rejected", i, "time_start") for i in range(24)
+    }
+    assert {r.bidding_zone for r in table.collect()} == {"NO2"}
+    assert checked.filter(F.col("status") == "rejected").count() == 25
 
 
 def test_prices_whose_duration_cannot_be_checked_are_rejected(spark, bronze):
