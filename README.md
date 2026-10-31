@@ -11,7 +11,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                         # All unit tests incl. Spark on GitHub-hosted runners (push to dev, PRs to dev/main)
-│       ├── pipeline.yml                   # Bronze -> chaos copy -> Silver on the VM runner (cron 02:00 UTC on main = prod; manual on dev = dev)
+│       ├── pipeline.yml                   # Bronze -> chaos copy -> Silver -> Gold on the VM runner (cron 02:00 UTC on main = prod; manual on dev = dev)
 │       └── backfill.yml                   # Manual historical Bronze backfill on the VM runner (main = prod, dev = dev)
 ├── config/
 │   ├── settings.py                        # dev/prod environment, data paths, env loader, and API base settings
@@ -34,11 +34,22 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   │   ├── zone_hourly.py                 # silver/zone_hourly: every zone x hour, prices + zone weather + HDH
 │   │   ├── reference.py                   # dim_station (config) and dim_date (holidays, hours per local day)
 │   │   └── quality.py                     # Issue log (DLQ), checks, scorecard, chaos score, run manifest
+│   ├── gold/
+│   │   ├── run_gold.py                    # Gold entrypoint CLI: rebuilds the Gold tables, checks, status file
+│   │   └── dashboard.py                   # Use case 2 tables: zone_daily, price_weather_sensitivity, price_profile
 │   └── utils/
 │       ├── hashing.py                     # Batch UUID4, ISO-8601 UTC, and SHA-256 payload checksums
 │       └── http.py                        # Shared requests.Session with retry/backoff & User-Agent
+├── dashboard/                             # Streamlit dashboard over Gold (see Dashboard below)
+│   ├── app.py                             # Entry point: menu from registry.py, sidebar data status
+│   ├── registry.py                        # The use cases: question, user, deadline, status, page module
+│   ├── data.py / ui.py / charts.py        # Reading Gold (pandas), cached loading, Altair charts
+│   └── views/                             # One page per use case (prices_weather.py) + overview and placeholder
+├── deploy/
+│   └── dat535-dashboard.service           # systemd unit that keeps the dashboard running on the VM
 ├── scripts/
-│   └── test_api_connections.py            # Diagnostic smoke-test for API connectivity & credentials
+│   ├── test_api_connections.py            # Diagnostic smoke-test for API connectivity & credentials
+│   └── make_sample_gold.py                # Synthetic Gold tables for trying the dashboard without the VM
 ├── tests/
 │   ├── test_ingestion.py                  # PyTest suite for hashing, envelopes, versioning, CLI dates, and clients
 │   └── test_backfill.py                   # PyTest suite for the historical backfill (monthly runs, resume, date guard)
@@ -46,6 +57,8 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   └── test_settings.py                   # PyTest suite for dev/prod environment and data path resolution
 │   └── conftest.py                        # Shared fixtures: local SparkSession, Bronze builders shaped like the APIs
 │   └── test_silver_*.py                   # Spark tests (marker `spark`): reader, prices, weather, zone_hourly, end-to-end runs
+│   └── test_gold_*.py                     # Spark tests: use case 2 tables, Bronze -> Silver -> Gold end-to-end
+│   └── test_dashboard_data.py             # Dashboard helpers and the sample generator (pandas, no Spark)
 ├── labs/                                  # Archived course laboratory materials (Lab 1, 2, 3)
 │   ├── lab1_1_setup_guide.md
 │   ├── lab1_install-spark.sh
@@ -60,10 +73,12 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   ├── Data_Engineering_Project_Definition_Guide_v3.pdf
 │   └── plans/
 │       ├── silver_layer.md                # Silver layer design (tables Gold reads, cleaning rules, quality evidence)
+│       ├── gold_layer.md                  # Gold layer and dashboard design (use case 2 tables, checks, freshness)
 │       └── use_cases.md                   # Proposed Gold use cases (dashboard, application, report, ML model)
 ├── dat535_data_engineering_project_definition.md # Official project specification & architecture
 ├── pyproject.toml                         # Pytest configuration (import path, test discovery)
 ├── requirements.txt                       # Project Python dependencies
+├── requirements-dashboard.txt             # Dashboard dependencies (Streamlit, pandas, pyarrow)
 └── .env.example                           # Template for local environment variables & API keys
 ```
 
@@ -97,7 +112,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
   * **Ground truth**: every run writes `/bronze_chaos/_manifests/run__{batch_id}.json` with the rate, seed, counts per error type, and every injected error (`file`, `type`, record `index`, `field`, `original` value). The data files carry no markers, so Silver must detect errors itself; its DLQ/dedup counts can then be scored against the union of these manifests.
   * **Reproducible & incremental**: each file's errors are seeded from `(seed, relative path)`, so daily runs and historical backfills damage a file identically. Files already in `/bronze_chaos/` are skipped; delete the folder to rebuild with a different `--rate`/`--seed`.
 * **Silver Layer**: PySpark cleans the chaos copy (by default) into typed, deduplicated UTC tables: `prices`, `weather_hourly` and `zone_hourly` (every zone × hour, the table Gold reads), plus `dim_date`, `dim_station`, the issue log `dq_issues` (DLQ), the scorecard `dq_metrics` and a run manifest. See [Silver Layer](#silver-layer) below and the design in [docs/plans/silver_layer.md](docs/plans/silver_layer.md).
-* **Gold Layer** *(Upcoming)*: Serving assets for regional grid economics and price sensitivity features. Proposed use cases: [docs/plans/use_cases.md](docs/plans/use_cases.md).
+* **Gold Layer**: tables shaped for one consumer each, read by the Streamlit dashboard. Use case 2 (prices and weather) is built; use cases 1, 3 and 4 are planned. See [Gold Layer & Dashboard](#gold-layer--dashboard) below, [docs/plans/gold_layer.md](docs/plans/gold_layer.md) and [docs/plans/use_cases.md](docs/plans/use_cases.md).
 
 ---
 
@@ -201,7 +216,7 @@ python src/ingestion/chaos_injector.py --rate 0.02 --seed 7
 
 ### Running on the VM Runner via GitHub Actions
 
-The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It has three jobs, each starting only after the previous one succeeds: `bronze` (ingestion), `bronze_chaos` (extends `/bronze_chaos/` with the newly ingested files) and `silver` (rebuilds the Silver tables, see [Silver Layer](#silver-layer)). `bronze_chaos` and `silver` are skipped on dry runs. Gold will be added as a dependent job in the same workflow. Runs from `main` write to `prod/`, runs from `dev` to `dev/` (see [Environments](#environments)).
+The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It has four jobs, each starting only after the previous one succeeds: `bronze` (ingestion), `bronze_chaos` (extends `/bronze_chaos/` with the newly ingested files), `silver` (rebuilds the Silver tables, see [Silver Layer](#silver-layer)) and `gold` (rebuilds the Gold tables, see [Gold Layer & Dashboard](#gold-layer--dashboard)). The last three are skipped on dry runs. Runs from `main` write to `prod/`, runs from `dev` to `dev/` (see [Environments](#environments)).
 
 1. **Schedule**: Daily at `02:00 UTC` (cron `0 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main` (prod).
 2. **Quality Gate**: Runs the unit test suite without the Spark tests (`pytest -q -m "not spark"`) automatically prior to executing ingestion; CI runs the Spark tests.
@@ -264,6 +279,54 @@ python src/silver/run_silver.py --input bronze --output-dir /tmp/silver_clean
 * **Checks before writing**: no duplicate or empty keys, whole hours, values within bounds, a complete zone × hour grid, non-empty `prices` and `weather_hourly`, and at most half of a source's records rejected. A failed hard check writes nothing and exits with code 1, so Gold keeps the previous Silver. Tables are written to `silver/_staging/` and swapped into place only after every write succeeded, so a crash while writing also leaves the previous Silver intact. Soft checks (incomplete days, weather completeness, rejected share) only warn.
 * **Chaos score**: on the chaos copy, every error listed in `bronze_chaos/_manifests` is matched against `dq_issues`. The share found per error type and the issues not on the chaos list go to the run manifest, `dq_metrics` and the step summary.
 * **Settings**: `SILVER_INPUT` (`bronze_chaos` or `bronze`), `SPARK_DRIVER_MEMORY` (default `2g`), `SPARK_SHUFFLE_PARTITIONS` (default 8).
+
+---
+
+## Gold Layer & Dashboard
+
+`src/gold/run_gold.py` rebuilds every Gold table from the newest successful Silver run (PySpark, DataFrame functions only). The design is in [docs/plans/gold_layer.md](docs/plans/gold_layer.md).
+
+```bash
+python src/gold/run_gold.py                                                    # <data root>/<env>/silver -> gold
+python src/gold/run_gold.py --silver-dir /tmp/silver_clean --output-dir /tmp/gold_clean
+```
+
+| Table | One row per | Contents |
+|---|---|---|
+| `zone_daily` | zone and Norwegian day | Average/min/max price, volatility, peak vs off-peak, negative hours, temperature, heating degree days, wind, hour counts, `is_complete` |
+| `price_weather_sensitivity` | zone and month | Monthly averages, and the correlation and slope of the daily price on temperature and wind (complete days only) |
+| `price_profile` | zone, year, season, day type, hour | Average price per Norwegian hour, for workdays vs weekends/holidays and winter vs summer |
+| `_status/latest.json` | newest successful run | When Gold was built, from which Silver run, rows, `data_through` (newest day complete in every zone), checks |
+
+* **Checks before writing**: no duplicate or empty keys, no day longer than its 23/24/25 hours, a non-empty `zone_daily`, the same number of price hours as Silver, and correlations in [−1, 1]. A failed check writes nothing (exit code 1), and the dashboard keeps showing the previous Gold. Every run also writes `_status/runs/run__<id>.json`.
+
+### Dashboard
+
+A Streamlit app with one page per use case. Use case 2 (prices and weather) is built. The other use cases have placeholder pages generated from [dashboard/registry.py](dashboard/registry.py), and adding one is a page module plus a registry change (see [gold_layer.md](docs/plans/gold_layer.md), section 6). The sidebar shows when Gold was built, how far the data reaches, and a warning when the data is late (not complete through yesterday by 06:00) or the last Gold run failed.
+
+**Locally, without the VM** (also on Windows; the sample tables are synthetic and marked as such on every page):
+
+```bash
+pip install -r requirements.txt -r requirements-dashboard.txt
+python scripts/make_sample_gold.py           # synthetic Gold into ./data/dev/gold
+streamlit run dashboard/app.py               # http://localhost:8501
+```
+
+**On the VM**, with the real Gold of an environment:
+
+```bash
+source ~/spark-env/bin/activate && pip install -r requirements-dashboard.txt
+DAT535_ENV=prod DAT535_DATA_DIR=~/spark-project-data \
+  streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true
+```
+
+It listens only on the VM itself. Open it from your laptop through an SSH tunnel, then browse to http://localhost:8501:
+
+```bash
+ssh -L 8501:localhost:8501 ubuntu@<vm floating ip>
+```
+
+To keep it running after you log out, use the systemd unit in [deploy/dat535-dashboard.service](deploy/dat535-dashboard.service). It runs the dashboard from its own clone, because the Actions runner replaces its work folder on every run. `DAT535_GOLD_DIR` points the dashboard at any other Gold folder.
 
 ---
 
