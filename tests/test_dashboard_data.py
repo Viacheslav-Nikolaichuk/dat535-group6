@@ -5,6 +5,7 @@ Plain pandas, no Streamlit or Spark; skipped when pandas isn't installed (the VM
 
 from datetime import date, datetime, timezone
 import json
+import os
 import subprocess
 import sys
 
@@ -17,6 +18,9 @@ from dashboard import data  # noqa: E402
 from config.settings import PROJECT_ROOT  # noqa: E402
 
 FIRST, LAST = date(2021, 11, 1), date(2026, 10, 30)
+
+# The generator refuses to run under prod, and the pipeline runs these tests with DAT535_ENV=prod on main.
+DEV_ENV = {**os.environ, "DAT535_ENV": "dev"}
 
 
 @pytest.mark.parametrize("preset, expected", [
@@ -104,7 +108,7 @@ def test_profile_weights_years_by_their_hours():
 def test_sample_gold_is_readable_by_the_dashboard(tmp_path):
     out = tmp_path / "gold"
     subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "make_sample_gold.py"), "--output-dir", str(out)],
-                   check=True, capture_output=True)
+                   check=True, capture_output=True, env=DEV_ENV)
 
     status = data.read_status(out)
     assert status["is_sample"] is True and status["freshness"]["data_through"]
@@ -122,5 +126,5 @@ def test_sample_generator_refuses_to_overwrite_real_gold(tmp_path):
     (out / "_status").mkdir(parents=True)
     (out / "_status" / "latest.json").write_text(json.dumps({"is_sample": False}), encoding="utf-8")
     result = subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "make_sample_gold.py"),
-                             "--output-dir", str(out)], capture_output=True, text=True)
-    assert result.returncode == 2 and "Refusing" in result.stdout
+                             "--output-dir", str(out)], capture_output=True, text=True, env=DEV_ENV)
+    assert result.returncode == 2 and "overwrite real Gold" in result.stdout
