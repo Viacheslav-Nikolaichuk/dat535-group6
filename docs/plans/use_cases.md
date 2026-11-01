@@ -1,6 +1,6 @@
 # Gold use cases
 
-**Status:** proposal for the team to discuss. Nothing here is built yet.
+**Status:** use case 2 (dashboard) is built: Gold tables, checks, status file and a Streamlit page ([gold_layer.md](gold_layer.md)). Use cases 1, 3 and 4 are still proposals, with placeholder pages in the dashboard.
 
 **Data:** two sources only: electricity prices (hvakosterstrommen.no) and weather (MET Frost). Elhub is out of scope; that work is archived on the branch `feat/elhub-bronze`.
 

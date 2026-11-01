@@ -1,0 +1,8 @@
+# Streamlit settings for the dashboard (dashboard/app.py). Read when Streamlit starts from the repository root.
+
+[client]
+# Hides the "Deploy" button (a shortcut to Streamlit's own cloud hosting) and the developer menu.
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
