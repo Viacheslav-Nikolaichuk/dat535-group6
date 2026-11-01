@@ -1,0 +1,6 @@
+# The Streamlit dashboard (dashboard/app.py). Kept apart from requirements.txt so the pipeline's
+# install on the VM runner stays small; CI installs both so the dashboard tests run.
+streamlit>=1.46
+altair>=5.0
+pandas>=2.0
+pyarrow>=14.0

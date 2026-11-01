@@ -2,7 +2,7 @@ name: Data Pipeline
 
 # Medallion pipeline on the self-hosted runner. Each layer is a job with `needs:` on the
 # previous one, so it only runs after that succeeds and can be re-run individually:
-# bronze -> bronze_chaos -> silver (Gold will follow the same pattern).
+# bronze -> bronze_chaos -> silver -> gold.
 #
 # Environment follows the branch: runs from main write to <data root>/prod (the cron
 # schedule only fires on main), manual runs from dev write to <data root>/dev.
@@ -199,3 +199,38 @@ jobs:
           # Rebuilds every Silver table from bronze_chaos/ (SILVER_INPUT) and writes the step summary.
           # Exit code 1 = a hard check failed and nothing was written (the previous Silver stays).
           python src/silver/run_silver.py
+
+  gold:
+    name: Gold Layer
+    # Skipped whenever silver is (dry runs) or fails: the dashboard keeps the previous Gold.
+    needs: silver
+    runs-on: self-hosted
+    timeout-minutes: 30
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+    env:
+      DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+
+    steps:
+      # main writes prod, dev writes dev; any other branch is refused before touching data.
+      - name: Guard branch
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|dev) ;;
+            *) echo "::error::Data workflows only run from main (prod) or dev (dev), not '$GITHUB_REF_NAME'"; exit 1 ;;
+          esac
+          if [ "$DAT535_ENV" = "prod" ] && [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Only main may write to prod"; exit 1
+          fi
+          echo "Environment: $DAT535_ENV -> $DAT535_DATA_DIR/$DAT535_ENV"
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Build Gold tables
+        run: |
+          set -euo pipefail
+          source ~/spark-env/bin/activate
+          # Rebuilds the Gold tables from the newest successful Silver and writes gold/_status/latest.json.
+          # Exit code 1 = a hard check failed and nothing was written (the previous Gold stays).
+          python src/gold/run_gold.py

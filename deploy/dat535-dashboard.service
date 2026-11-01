@@ -1,0 +1,30 @@
+# systemd unit that keeps the Streamlit dashboard running on the VM (docs/plans/gold_layer.md, G6).
+#
+# The dashboard runs from its own clone of the repository, not from the Actions runner's work folder,
+# which is replaced on every workflow run:
+#   git clone <repo url> ~/dat535-dashboard && cd ~/dat535-dashboard
+#   source ~/spark-env/bin/activate && pip install -r requirements.txt -r requirements-dashboard.txt
+#
+# Install and start:
+#   sudo cp deploy/dat535-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dat535-dashboard
+#   journalctl -u dat535-dashboard -f        # logs
+#
+# Open it from your laptop through an SSH tunnel (nothing is exposed publicly):
+#   ssh -L 8501:localhost:8501 ubuntu@<vm floating ip>     then browse to http://localhost:8501
+
+[Unit]
+Description=DAT535 Streamlit dashboard (Gold layer)
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/dat535-dashboard
+Environment=DAT535_ENV=prod
+Environment=DAT535_DATA_DIR=/home/ubuntu/spark-project-data
+ExecStart=/home/ubuntu/spark-env/bin/streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

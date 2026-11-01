@@ -38,8 +38,9 @@ jobs:
           distribution: temurin
           java-version: '8'
 
+      # The dashboard requirements are installed too, so its data helpers are tested.
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-dashboard.txt
 
       - name: Run unit tests
         run: pytest -q
