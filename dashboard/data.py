@@ -236,12 +236,15 @@ def _with_month_start(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def bill_months(bill: pd.DataFrame) -> pd.DataFrame:
-    """Every month of household_bill_monthly, newest first: year, month, month_start, is_final.
+    """Every month of household_bill_monthly, newest first: year, month, month_start, is_final, in_progress.
 
-    A month is final when it is final in every zone.
+    A month is final when it is final in every zone. in_progress marks the newest month while it is not
+    final yet (month to date). An older month that isn't final has hours that could not be billed.
     """
     months = bill[bill["scheme"] == SCHEME_NONE].groupby(["year", "month"], as_index=False)["is_final"].all()
-    return _with_month_start(months).sort_values("month_start", ascending=False, ignore_index=True)
+    months = _with_month_start(months).sort_values("month_start", ascending=False, ignore_index=True)
+    months["in_progress"] = ~months["is_final"] & (months["month_start"] == months["month_start"].max())
+    return months
 
 
 def _bills_wide(rows: pd.DataFrame, index: str) -> pd.DataFrame:

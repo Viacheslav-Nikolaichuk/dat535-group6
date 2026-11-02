@@ -27,6 +27,9 @@ MUTED = "#898781"
 
 DAY_TYPE_LABELS = {"workday": "Workday", "weekend_holiday": "Weekend or holiday"}
 
+# One tick per month: with only a few months, the default ticks fall mid-month and repeat the label.
+MONTH_TICKS = {"interval": "month", "step": 1}
+
 
 def _dark() -> bool:
     theme = getattr(getattr(st, "context", None), "theme", None)
@@ -64,11 +67,13 @@ def lines(
     series_labels: Optional[Dict[str, str]] = None,
     single_color: str = ZONE_COLORS_LIGHT[0],
     hour_of_day: bool = False,
+    monthly: bool = False,
     height: int = 300,
 ) -> alt.Chart:
     """A line per series with a crosshair: hovering anywhere shows every series' value at that x.
 
     hour_of_day: x holds hours 0-23, labelled as clock times (00:00, 03:00, ...).
+    monthly: x holds the first day of each month; one tick per month.
     """
     y_fmt = ".1f"
     hover = alt.selection_point(nearest=True, on="pointerover", fields=[x], empty=False, clear="pointerout")
@@ -78,7 +83,8 @@ def lines(
                       axis=alt.Axis(values=list(range(0, 24, 3)), labelExpr=clock.format(v="value")))
         x_tip = alt.Tooltip("clock:N", title=x_title or "Hour")
     else:
-        x_axis = alt.Axis(format=x_format, labelOverlap=True) if x_format else alt.Axis(labelOverlap=True)
+        x_axis = alt.Axis(labelOverlap=True, **({"format": x_format} if x_format else {}),
+                          **({"tickCount": MONTH_TICKS} if monthly else {}))
         x_enc = alt.X(f"{x}:{x_type}", title=x_title, axis=x_axis)
         x_tip = alt.Tooltip(f"{x}:{x_type}", title=x_title or "Date", **({"format": x_format} if x_format else {}))
 
@@ -160,7 +166,7 @@ def columns(
 ) -> alt.LayerChart:
     """Columns from a zero baseline; values may be negative. Empty values leave a gap."""
     bars = alt.Chart(df).mark_bar(color=color, cornerRadiusEnd=4, size=12).encode(
-        x=alt.X(f"{x}:T", title=None, axis=alt.Axis(format=x_format, labelOverlap=True)),
+        x=alt.X(f"{x}:T", title=None, axis=alt.Axis(format=x_format, labelOverlap=True, tickCount=MONTH_TICKS)),
         y=alt.Y(f"{y}:Q", title=y_title),
         tooltip=[alt.Tooltip(f"{x}:T", title="Month", format="%B %Y"),
                  alt.Tooltip(f"{y}:Q", title=y_title, format=".2f"), *tooltip_extra],
