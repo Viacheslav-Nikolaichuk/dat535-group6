@@ -56,12 +56,19 @@ def _answer(report) -> str:
     with_norgespris = report.dropna(subset=["norgespris_nok"])
     if with_norgespris.empty:
         return "Norgespris didn't exist yet: households had strømstønad."
-    cheaper = with_norgespris[with_norgespris["cheaper"] == data.SCHEME_LABELS["norgespris"]]["bidding_zone"]
-    if cheaper.empty:
+    zones = with_norgespris.groupby("cheaper")["bidding_zone"].agg(", ".join)
+    norgespris = zones.get(data.SCHEME_LABELS["norgespris"])
+    stromstotte = zones.get(data.SCHEME_LABELS["stromstotte"])
+    if not norgespris:
         return "Strømstønad was cheaper than Norgespris in every zone."
-    if len(cheaper) == len(with_norgespris):
+    if not stromstotte:
         return "Norgespris was cheaper than strømstønad in every zone."
-    return f"Norgespris was cheaper than strømstønad in {', '.join(cheaper)}; strømstønad in the other zones."
+    return f"Norgespris was cheaper than strømstønad in {norgespris}; strømstønad was cheaper in {stromstotte}."
+
+
+def _month_label(month) -> str:
+    status = " (month to date)" if month["in_progress"] else "" if month["is_final"] else " (incomplete)"
+    return f"{month['month_start']:%B %Y}{status}"
 
 
 def render() -> None:
@@ -83,11 +90,8 @@ def render() -> None:
     final = months.index[months["is_final"]]
     left, right = st.columns([3, 1])
     with left:
-        choice = st.selectbox(
-            "Month", months.index, index=int(final[0]) if len(final) else 0,
-            format_func=lambda i: f"{months.at[i, 'month_start']:%B %Y}"
-                                  + ("" if months.at[i, "is_final"] else " (month to date)"),
-        )
+        choice = st.selectbox("Month", months.index, index=int(final[0]) if len(final) else 0,
+                              format_func=lambda i: _month_label(months.loc[i]))
     with right:
         zone = st.selectbox("Zone for the history", PRICE_ZONES, format_func=lambda z: f"{z} {names[z]}")
     month = months.loc[choice]
@@ -99,9 +103,15 @@ def render() -> None:
     st.subheader(f"The bill for {month['month_start']:%B %Y}")
     if month["is_final"]:
         st.caption("Final: every hour of the month has a price in every zone.")
-    else:
+    elif month["in_progress"]:
         st.caption(f"Month to date: {report['billed_hours'].min()} of {report['hours_in_month'].max()} hours so far. "
                    "The final bill is ready on the 1st of the next month.")
+    else:
+        gaps = report[report["billed_hours"] < report["hours_in_month"]]
+        missing = ", ".join(f"{r.bidding_zone}: {r.hours_in_month - r.billed_hours} of {r.hours_in_month} hours"
+                            for r in gaps.itertuples())
+        st.caption(f"Incomplete: some hours could not be billed, usually because they have no price "
+                   f"({missing} missing). The bills cover the other hours, and the month stays preliminary.")
     st.markdown(f"**{_answer(report)}**")
     st.dataframe(report, hide_index=True, use_container_width=True, column_config=COLUMNS,
                  column_order=["bidding_zone", *SHOWN])
@@ -118,15 +128,21 @@ def render() -> None:
     st.header(f"Month by month in {zone} · {names[zone]}")
     history = data.bill_history(bill, zone)
     by_month = data.bill_by_month(history)
+    # The month in progress has only a few days; next to whole months it would look like a collapse.
+    in_progress = months.loc[months["in_progress"], "month_start"]
 
     st.markdown("**The monthly bill under each scheme**")
+    if not in_progress.empty:
+        st.caption(f"{in_progress.iloc[0]:%B %Y} is still in progress, so the charts leave it out; "
+                   "it is in the table below.")
     st.altair_chart(
-        charts.lines(history, "month_start", "cost_nok", "NOK per month", series="scheme", domain=SCHEMES,
-                     colors=charts.scheme_colors(), series_labels=data.SCHEME_LABELS, x_format="%b %Y"),
+        charts.lines(history[~history["month_start"].isin(in_progress)], "month_start", "cost_nok",
+                     "NOK per month", series="scheme", domain=SCHEMES, colors=charts.scheme_colors(),
+                     series_labels=data.SCHEME_LABELS, x_format="%b %Y", monthly=True),
         use_container_width=True,
     )
 
-    saving = by_month.dropna(subset=["norgespris_saving_nok"])
+    saving = by_month[~by_month["month_start"].isin(in_progress)].dropna(subset=["norgespris_saving_nok"])
     if not saving.empty:
         st.markdown("**What Norgespris saved compared with strømstønad**")
         st.caption(f"Above zero, Norgespris was cheaper that month; below zero, strømstønad was. "

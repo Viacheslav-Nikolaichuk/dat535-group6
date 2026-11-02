@@ -137,7 +137,12 @@ def test_the_report_compares_the_schemes_per_zone():
 
 def test_bill_months_are_newest_first_and_final_only_in_every_zone():
     months = data.bill_months(BILL)
-    assert list(zip(months["month"], months["is_final"])) == [(11, False), (10, True), (9, True)]
+    assert list(zip(months["month"], months["is_final"], months["in_progress"])) == [
+        (11, False, True), (10, True, False), (9, True, False)]
+
+    # An older month that isn't final has hours without a price: incomplete, not month to date.
+    months = data.bill_months(BILL.assign(is_final=BILL["month"] == 10))
+    assert months["in_progress"].tolist() == [True, False, False] and not months["is_final"].iloc[2]
 
 
 def test_bill_history_and_months_for_one_zone():
