@@ -11,7 +11,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                         # All unit tests incl. Spark on GitHub-hosted runners (push to dev, PRs to dev/main)
-│       ├── pipeline.yml                   # Bronze -> chaos copy -> Silver -> Gold on the VM runner (cron 02:00 UTC on main = prod; manual on dev = dev)
+│       ├── pipeline.yml                   # Bronze -> chaos copy -> Silver -> Gold on the VM runner (cron 02:17 UTC on main = prod; manual on dev = dev)
 │       └── backfill.yml                   # Manual historical Bronze backfill on the VM runner (main = prod, dev = dev)
 ├── config/
 │   ├── settings.py                        # dev/prod environment, data paths, env loader, and API base settings
@@ -218,7 +218,7 @@ python src/ingestion/chaos_injector.py --rate 0.02 --seed 7
 
 The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It has four jobs, each starting only after the previous one succeeds: `bronze` (ingestion), `bronze_chaos` (extends `/bronze_chaos/` with the newly ingested files), `silver` (rebuilds the Silver tables, see [Silver Layer](#silver-layer)) and `gold` (rebuilds the Gold tables, see [Gold Layer & Dashboard](#gold-layer--dashboard)). The last three are skipped on dry runs. Runs from `main` write to `prod/`, runs from `dev` to `dev/` (see [Environments](#environments)).
 
-1. **Schedule**: Daily at `02:00 UTC` (cron `0 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main` (prod).
+1. **Schedule**: Daily at `02:17 UTC` (cron `17 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main` (prod). GitHub can start scheduled runs late, especially at the start of an hour, so the cron avoids minute 0. At `0 2 * * *` the runs started 5.5–7 hours late.
 2. **Quality Gate**: Runs the unit test suite without the Spark tests (`pytest -q -m "not spark"`) automatically prior to executing ingestion; CI runs the Spark tests.
 3. **Concurrency & Safety**: Protected by a concurrency lock per branch (`data-pipeline-main`, `data-pipeline-dev`), so two runs never write the same environment at once and dev runs never delay prod. Inputs are checked with strict regexes to prevent shell injection.
 4. **Manual Dispatch**: Go to **Actions** -> **Data Pipeline** -> **Run workflow**, choose the branch (`main` = prod, `dev` = dev):

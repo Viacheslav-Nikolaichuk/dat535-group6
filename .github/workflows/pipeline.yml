@@ -9,10 +9,12 @@ name: Data Pipeline
 
 on:
   schedule:
-    # Runs daily at 02:00 UTC (after previous day hourly observations are fully settled).
+    # Runs daily at 02:17 UTC (after previous day hourly observations are fully settled).
     # Scheduled runs re-check the last 3 days: missed runs are filled in and MET Norway
     # QC revisions become new Bronze versions; unchanged days are skipped via checksum.
-    - cron: '0 2 * * *'
+    # Not on the hour: GitHub delays scheduled runs under high load, which peaks at the start
+    # of every hour. At '0 2 * * *' the runs started 5.5-7 hours late (30 Oct - 2 Nov 2026).
+    - cron: '17 2 * * *'
   workflow_dispatch:
     inputs:
       target_date:

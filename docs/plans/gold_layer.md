@@ -53,7 +53,9 @@ The tests recompute the figures from hand-made hourly data. For example, a price
 
 ## 5. Freshness and readiness
 
-The 02:00 UTC pipeline runs Bronze → chaos copy → Silver → **Gold** (`pipeline.yml`, job `gold`). Gold runs only when Silver succeeded, and it is ready long before the dashboard's 06:00 deadline.
+The nightly pipeline runs Bronze → chaos copy → Silver → **Gold** (`pipeline.yml`, job `gold`). Gold runs only when Silver succeeded, and the whole run takes about 2 minutes.
+
+GitHub starts scheduled runs late. With the cron at 02:00 UTC, the first scheduled runs started 5.5–7 hours late (07:35–09:14 UTC, 30 Oct to 2 Nov 2026), so Gold was ready at about 08:40–10:20 Norwegian time instead of by 06:00. GitHub says scheduled runs are delayed most at the start of each hour, so the cron now runs at 02:17 UTC. We can't control the rest of the delay. While the data is late, the dashboard says so (below).
 
 `gold/_status/latest.json` (newest successful run) and `gold/_status/runs/run__<id>.json` (every run, including failed ones) hold:
 - `built_at_utc`, the Silver run Gold was built from, and rows per table;
