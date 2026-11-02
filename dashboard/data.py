@@ -15,6 +15,7 @@ from dateutil import tz
 import numpy as np
 import pandas as pd
 
+from config.price_rules import SCHEME_NONE, SCHEME_NORGESPRIS, SCHEME_STROMSTOTTE, SCHEMES
 from config.settings import GOLD_DIR, PRICE_ZONES, ZONES_CONFIG_FILE
 
 OSLO = tz.gettz("Europe/Oslo")
@@ -222,3 +223,76 @@ def profile_for(profile: pd.DataFrame, zone: str, start: date, end: date, season
     out = weighted.groupby(["day_type", "local_hour"], as_index=False)[["total", "n_hours"]].sum()
     out["price_ore"] = out["total"] / out["n_hours"] * 100
     return out[["day_type", "local_hour", "price_ore", "n_hours"]]
+
+
+# ---------------------------------------------------------------------- #
+# Figures for the monthly household bill page (use case 3)
+# ---------------------------------------------------------------------- #
+SCHEME_LABELS = {SCHEME_NONE: "No support", SCHEME_STROMSTOTTE: "Strømstønad", SCHEME_NORGESPRIS: "Norgespris"}
+
+
+def _with_month_start(df: pd.DataFrame) -> pd.DataFrame:
+    return df.assign(month_start=pd.to_datetime(dict(year=df["year"], month=df["month"], day=1)))
+
+
+def bill_months(bill: pd.DataFrame) -> pd.DataFrame:
+    """Every month of household_bill_monthly, newest first: year, month, month_start, is_final, in_progress.
+
+    A month is final when it is final in every zone. in_progress marks the newest month while it is not
+    final yet (month to date). An older month that isn't final has hours that could not be billed.
+    """
+    months = bill[bill["scheme"] == SCHEME_NONE].groupby(["year", "month"], as_index=False)["is_final"].all()
+    months = _with_month_start(months).sort_values("month_start", ascending=False, ignore_index=True)
+    months["in_progress"] = ~months["is_final"] & (months["month_start"] == months["month_start"].max())
+    return months
+
+
+def _bills_wide(rows: pd.DataFrame, index: str) -> pd.DataFrame:
+    """One row per `index` value: kWh, the bill under each scheme, and which scheme was cheaper.
+
+    norgespris_saving_nok is the strømstønad bill minus the Norgespris bill: above zero, Norgespris
+    was cheaper. It is empty in months without Norgespris.
+    """
+    costs = rows.set_index([index, "scheme"])["cost_nok"].unstack().reindex(columns=list(SCHEMES))
+    base = rows[rows["scheme"] == SCHEME_NONE].set_index(index)
+    saving = costs[SCHEME_STROMSTOTTE] - costs[SCHEME_NORGESPRIS]
+    cheaper = pd.Series(np.select(
+        [saving > 0, saving < 0, saving == 0],
+        [SCHEME_LABELS[SCHEME_NORGESPRIS], SCHEME_LABELS[SCHEME_STROMSTOTTE], "Same"], "–",
+    ), index=saving.index)
+    return pd.DataFrame({
+        "kwh": base["kwh"],
+        "no_support_nok": costs[SCHEME_NONE],
+        "stromstotte_nok": costs[SCHEME_STROMSTOTTE],
+        "norgespris_nok": costs[SCHEME_NORGESPRIS],
+        "norgespris_saving_nok": saving.round(2),
+        "cheaper": cheaper,
+        "is_final": base["is_final"],
+        "billed_hours": base["billed_hours"],
+        "hours_in_month": base["hours_in_month"],
+    })
+
+
+def bill_for_month(bill: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
+    """The report for one month: one row per zone (see _bills_wide)."""
+    rows = bill[(bill["year"] == year) & (bill["month"] == month)]
+    wide = _bills_wide(rows, "bidding_zone")
+    return wide.reindex([z for z in PRICE_ZONES if z in wide.index]).rename_axis("bidding_zone").reset_index()
+
+
+def bill_history(bill: pd.DataFrame, zone: str) -> pd.DataFrame:
+    """One zone's bills, one row per month and scheme, oldest first (for the chart)."""
+    rows = _with_month_start(bill[bill["bidding_zone"] == zone])
+    return rows.sort_values(["scheme", "month_start"], ignore_index=True)
+
+
+def bill_by_month(history: pd.DataFrame) -> pd.DataFrame:
+    """One zone's bills, one row per month (see _bills_wide), newest first."""
+    return _bills_wide(history, "month_start").sort_index(ascending=False).reset_index()
+
+
+def household_kwh_per_year(bill: pd.DataFrame, zone: str) -> Optional[float]:
+    """kWh the modelled household used in the zone's 12 newest final months, or None with fewer."""
+    rows = bill[(bill["bidding_zone"] == zone) & (bill["scheme"] == SCHEME_NONE) & bill["is_final"]]
+    newest = rows.sort_values(["year", "month"]).tail(12)
+    return float(newest["kwh"].sum()) if len(newest) == 12 else None

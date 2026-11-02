@@ -19,7 +19,7 @@ from src.silver.quality import Check  # noqa: E402
 pytestmark = pytest.mark.spark
 
 STATIONS = ["SN18700", "SN39040", "SN44560", "SN50540", "SN68860", "SN90450"]
-TABLES = ["zone_daily", "price_weather_sensitivity", "price_profile"]
+TABLES = ["zone_daily", "price_weather_sensitivity", "price_profile", "household_bill_monthly"]
 
 
 def _silver(spark, bronze: BronzeFactory, tmp_path: Path) -> Path:
@@ -47,6 +47,9 @@ def test_full_run_writes_tables_and_status(spark, bronze, tmp_path):
     assert daily.filter("is_complete").count() == 10
     assert spark.read.parquet(str(out / "price_weather_sensitivity")).count() == 5  # one month per zone
     assert spark.read.parquet(str(out / "price_profile")).count() == 5 * 24  # winter workdays only
+    bill = spark.read.parquet(str(out / "household_bill_monthly"))
+    assert bill.count() == 5 * 2  # January 2024: no support and strømstønad; Norgespris came in 2025
+    assert bill.filter("is_final").count() == 0  # two days of January
     assert len(list((out / "zone_daily").glob("*.parquet"))) == 1  # one small file per table
     assert not (out / gold.STAGING_DIR).exists()
 
@@ -54,7 +57,7 @@ def test_full_run_writes_tables_and_status(spark, bronze, tmp_path):
     assert status["status"] == "SUCCESS" and status["is_sample"] is False
     assert status["silver"]["run_id"] == gold.latest_silver_run(silver_dir)["run_id"]
     assert {name: t["rows"] for name, t in status["tables"].items()} == {
-        "zone_daily": 10, "price_weather_sensitivity": 5, "price_profile": 120,
+        "zone_daily": 10, "price_weather_sensitivity": 5, "price_profile": 120, "household_bill_monthly": 10,
     }
     assert (status["first_date"], status["last_date"]) == ("2024-01-15", "2024-01-16")
     assert status["freshness"]["data_through"] == "2024-01-16"

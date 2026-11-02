@@ -1,6 +1,6 @@
 # Gold use cases
 
-**Status:** use case 2 (dashboard) is built: Gold tables, checks, status file and a Streamlit page ([gold_layer.md](gold_layer.md)). Use cases 1, 3 and 4 are still proposals, with placeholder pages in the dashboard.
+**Status:** use cases 2 (dashboard) and 3 (report) are built: Gold tables, checks, status file and a Streamlit page each ([gold_layer.md](gold_layer.md)). Use cases 1 and 4 are still proposals, with placeholder pages in the dashboard.
 
 **Data:** two sources only: electricity prices (hvakosterstrommen.no) and weather (MET Frost). Elhub is out of scope; that work is archived on the branch `feat/elhub-bronze`.
 
@@ -184,6 +184,12 @@ The costs cover the energy price including VAT only. The grid tariff and the sup
 - A month's final report is ready on the 1st of the next month by **06:00**.
 
 **If data is missing.** A month with missing days stays `is_final = false` and is shown as preliminary.
+
+**As built** ([gold_layer.md](gold_layer.md), section 3):
+- The bill starts in January 2024, the first year the price rules in section 9 cover.
+- The household is the one above, `kWh = 0.6 + 0.1 × hdh`. In NO1 that comes to about 13,800 kWh a year: 0.6 × 8,760 hours + 0.1 × 24 × the 3,555 heating degree days from 2 Nov 2025 to 1 Nov 2026. The page shows the exact figure for each zone.
+- An hour without a temperature uses the zone's average `hdh` for that month. Otherwise one missing weather hour would keep a month preliminary for good.
+- A month is final when every hour of it has a price.
 
 **Proof.**
 - Monthly sums equal the sum of the hourly rows.
