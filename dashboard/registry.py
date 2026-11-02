@@ -72,8 +72,9 @@ USE_CASES = [
         ready_by="06:00 on the 1st",
         refresh="Monthly, with a month-to-date row updated daily",
         gold_tables=("household_bill_monthly",),
-        status=PLANNED,
+        status=READY,
         icon=":material/receipt_long:",
+        view="dashboard.views.household_bill",
     ),
     UseCase(
         key="price-outlook",

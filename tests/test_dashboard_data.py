@@ -105,6 +105,55 @@ def test_profile_weights_years_by_their_hours():
     assert row.price_ore == pytest.approx(175.0) and row.n_hours == 400
 
 
+def _bill(rows):
+    """household_bill_monthly rows: zone, year, month, scheme, kWh, cost, final."""
+    df = pd.DataFrame(rows, columns=["bidding_zone", "year", "month", "scheme", "kwh", "cost_nok", "is_final"])
+    return df.assign(billed_hours=744, hours_in_month=744)
+
+
+BILL = _bill([
+    ("NO1", 2025, 9, "no_support", 1000.0, 1500.0, True),
+    ("NO1", 2025, 9, "stromstotte", 1000.0, 1300.0, True),
+    ("NO1", 2025, 10, "no_support", 1200.0, 1500.0, True),
+    ("NO1", 2025, 10, "stromstotte", 1200.0, 1400.0, True),
+    ("NO1", 2025, 10, "norgespris", 1200.0, 600.0, True),
+    ("NO4", 2025, 10, "no_support", 1500.0, 300.0, True),
+    ("NO4", 2025, 10, "stromstotte", 1500.0, 300.0, True),
+    ("NO4", 2025, 10, "norgespris", 1500.0, 600.0, True),
+    ("NO1", 2025, 11, "no_support", 100.0, 150.0, False),  # month to date
+    ("NO4", 2025, 11, "no_support", 100.0, 20.0, True),
+])
+
+
+def test_the_report_compares_the_schemes_per_zone():
+    report = data.bill_for_month(BILL, 2025, 10)
+    assert report["bidding_zone"].tolist() == ["NO1", "NO4"]
+    assert report["norgespris_saving_nok"].tolist() == [800.0, -300.0]
+    assert report["cheaper"].tolist() == ["Norgespris", "Strømstønad"]
+
+    september = data.bill_for_month(BILL, 2025, 9)  # before Norgespris
+    assert september["norgespris_nok"].isna().all() and september["cheaper"].tolist() == ["–"]
+
+
+def test_bill_months_are_newest_first_and_final_only_in_every_zone():
+    months = data.bill_months(BILL)
+    assert list(zip(months["month"], months["is_final"])) == [(11, False), (10, True), (9, True)]
+
+
+def test_bill_history_and_months_for_one_zone():
+    history = data.bill_history(BILL, "NO1")
+    assert len(history) == 6 and history["month_start"].min() == pd.Timestamp("2025-09-01")
+    by_month = data.bill_by_month(history)
+    assert by_month["month_start"].tolist() == [pd.Timestamp(f"2025-{m}-01") for m in (11, 10, 9)]
+    assert by_month["norgespris_saving_nok"].tolist()[1] == 800.0
+
+
+def test_household_kwh_per_year_needs_twelve_final_months():
+    year = _bill([("NO1", 2025, m, "no_support", 1000.0 + m, 0.0, True) for m in range(1, 13)])
+    assert data.household_kwh_per_year(year, "NO1") == 12000.0 + sum(range(1, 13))
+    assert data.household_kwh_per_year(year.iloc[1:], "NO1") is None
+
+
 def test_sample_gold_is_readable_by_the_dashboard(tmp_path):
     out = tmp_path / "gold"
     subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "make_sample_gold.py"), "--output-dir", str(out)],
@@ -119,6 +168,15 @@ def test_sample_gold_is_readable_by_the_dashboard(tmp_path):
     summary = data.zone_summary(daily)
     assert summary["bidding_zone"].tolist() == ["NO1", "NO2", "NO3", "NO4", "NO5"]
     assert len(data.read_table(out / "price_profile")) == status["tables"]["price_profile"]["rows"]
+
+    bill = data.read_table(out / "household_bill_monthly")
+    assert len(bill) == status["tables"]["household_bill_monthly"]["rows"]
+    months = data.bill_months(bill)
+    assert (months["year"].min(), months["month"].iloc[-1]) == (2024, 1)
+    assert months["is_final"].iloc[1:].all()  # only the newest month can be month to date
+    report = data.bill_for_month(bill, months["year"].iloc[1], months["month"].iloc[1])
+    assert report["bidding_zone"].tolist() == ["NO1", "NO2", "NO3", "NO4", "NO5"]
+    assert (report["kwh"] > 0).all() and data.household_kwh_per_year(bill, "NO1") > 0
 
 
 def test_sample_generator_refuses_to_overwrite_real_gold(tmp_path):

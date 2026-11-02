@@ -5,6 +5,8 @@ Altair charts for the dashboard, in one consistent style:
     so they never look like a zone. Both sets pass the colour-blindness checks of the dataviz palette
     validator in light and dark mode. Three light-mode colours are below 3:1 contrast, so every chart
     has a legend or a title naming the series, and a table view next to it;
+  * the bill's schemes (use case 3, its own page) reuse slots 6-7 for strømstønad and Norgespris, with
+    "no support" as the muted grey reference line; all three pairs pass the same checks in both modes;
   * 2 px lines, 8 px points, hairline grid, one y-axis per chart, tooltips on hover;
   * prices in øre/kWh (NOK x 100).
 """
@@ -33,6 +35,11 @@ def _dark() -> bool:
 
 def zone_colors() -> Dict[str, str]:
     return dict(zip(PRICE_ZONES, ZONE_COLORS_DARK if _dark() else ZONE_COLORS_LIGHT))
+
+
+def scheme_colors() -> List[str]:
+    """No support, strømstønad, Norgespris (config.price_rules.SCHEMES order)."""
+    return [MUTED, *(DAY_TYPE_COLORS_DARK if _dark() else DAY_TYPE_COLORS_LIGHT)]
 
 
 def _scale(domain: Sequence[str], colors: Sequence[str]) -> alt.Scale:
