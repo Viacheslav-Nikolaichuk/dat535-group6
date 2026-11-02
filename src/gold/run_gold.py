@@ -11,6 +11,7 @@ Every run rebuilds all Gold tables from the newest successful Silver (docs/plans
 
 Tables land in <data root>/<env>/gold/:
   use case 2 (dashboard): zone_daily, price_weather_sensitivity, price_profile
+  use case 3 (report): household_bill_monthly
   status: _status/latest.json (newest successful run), _status/runs/run__<run_id>.json (every run)
 
 Usage:
@@ -37,12 +38,20 @@ if str(PROJECT_ROOT) not in sys.path:
 from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
 
+from config.price_rules import (  # noqa: E402
+    BILL_START,
+    NORGESPRIS_NOK,
+    SCHEME_NONE,
+    SCHEME_NORGESPRIS,
+    SUPPORT_CAP_KWH,
+)
 from config.settings import DAT535_ENV, GOLD_DIR, PRICE_ZONES, SILVER_DIR  # noqa: E402
 from src.gold.dashboard import (  # noqa: E402
     build_price_profile,
     build_price_weather_sensitivity,
     build_zone_daily,
 )
+from src.gold.household_bill import build_household_bill_monthly, vat_rate  # noqa: E402
 from src.ingestion.bronze_writer import BronzeWriter  # noqa: E402
 from src.silver.quality import Check, check_dicts  # noqa: E402
 from src.silver.run_silver import STAGING_DIR, publish, write_table  # noqa: E402
@@ -60,11 +69,13 @@ TABLE_KEYS = {
     "zone_daily": ["bidding_zone", "local_date"],
     "price_weather_sensitivity": ["bidding_zone", "year", "month"],
     "price_profile": ["bidding_zone", "year", "season", "day_type", "local_hour"],
+    "household_bill_monthly": ["bidding_zone", "year", "month", "scheme"],
 }
 
 # Which tables each use case reads; the dashboard's registry names the same tables.
 USE_CASE_TABLES = {
     "prices_weather": ["zone_daily", "price_weather_sensitivity", "price_profile"],
+    "household_bill": ["household_bill_monthly"],
 }
 
 STATUS_DIR = "_status"
@@ -120,7 +131,45 @@ def run_checks(tables: Dict[str, DataFrame], silver_price_hours: int) -> List[Ch
     ).count()
     checks.append(Check("price_weather_sensitivity.correlation_range", True, bad_corr == 0, float(bad_corr),
                         "correlations outside [-1, 1]"))
-    return checks
+    return checks + household_bill_checks(tables["household_bill_monthly"], daily)
+
+
+def household_bill_checks(bill: DataFrame, zone_daily: DataFrame) -> List[Check]:
+    """Use case 3: the month's hours add up, and the bills follow the price rules."""
+    keys = ["bidding_zone", "year", "month"]
+    month_length = F.col("hours_in_month")
+    too_long = bill.filter(
+        month_length.isNull()
+        | (F.col("price_hours") > month_length)
+        | (F.col("billed_hours") > F.col("price_hours"))
+    ).count()
+
+    # zone_daily already matches Silver's price hours, so each month's bill must match zone_daily.
+    expected = (
+        zone_daily.filter(F.col("local_date") >= BILL_START)
+        .groupBy(*keys).agg(F.sum("price_hours").alias("expected_hours"))
+    )
+    billed = bill.filter(F.col("scheme") == SCHEME_NONE).select(*keys, "price_hours")
+    mismatched = expected.join(billed, keys, "full").filter(
+        ~F.col("expected_hours").eqNullSafe(F.col("price_hours"))
+    ).count()
+
+    norgespris = bill.filter(F.col("scheme") == SCHEME_NORGESPRIS)
+    off_price = norgespris.filter(
+        F.abs(F.col("cost_nok") - F.col("kwh") * NORGESPRIS_NOK * (1 + vat_rate())) > 0.01
+    ).count()
+    over_cap = bill.filter(F.col("kwh") > SUPPORT_CAP_KWH).count()
+
+    return [
+        Check("household_bill_monthly.hours_within_month", True, too_long == 0, float(too_long),
+              "months with more hours than the month has, or no month length"),
+        Check("household_bill_monthly.price_hours_match_zone_daily", True, mismatched == 0, float(mismatched),
+              "zone-months whose price hours differ from zone_daily"),
+        Check("household_bill_monthly.norgespris_price", True, off_price == 0, float(off_price),
+              f"Norgespris bills that are not kWh x {NORGESPRIS_NOK} NOK plus VAT"),
+        Check("household_bill_monthly.below_support_cap", True, over_cap == 0, float(over_cap),
+              f"months above the {SUPPORT_CAP_KWH} kWh support cap the bill leaves out"),
+    ]
 
 
 def freshness(zone_daily: DataFrame) -> Dict:
@@ -214,6 +263,7 @@ def run_gold(
         "zone_daily": zone_daily,
         "price_weather_sensitivity": build_price_weather_sensitivity(zone_hourly, zone_daily).cache(),
         "price_profile": build_price_profile(zone_hourly).cache(),
+        "household_bill_monthly": build_household_bill_monthly(zone_hourly, dim_date).cache(),
     }
 
     # 3. Checks, before anything is written.

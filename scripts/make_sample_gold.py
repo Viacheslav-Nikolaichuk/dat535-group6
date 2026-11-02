@@ -28,9 +28,26 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
+from config.price_rules import (  # noqa: E402
+    BASE_LOAD_KWH,
+    BILL_START,
+    KWH_PER_HDH,
+    NO_VAT_ZONES,
+    NORGESPRIS_FROM,
+    NORGESPRIS_NOK,
+    NORGESPRIS_TO,
+    SCHEME_NONE,
+    SCHEMES,
+    STROMSTOTTE_SHARE,
+    STROMSTOTTE_THRESHOLD_NOK,
+    VAT,
+)
 from config.settings import DAT535_ENV, GOLD_DIR, HISTORY_START  # noqa: E402
 
-TABLES = ["zone_daily", "price_weather_sensitivity", "price_profile"]
+USE_CASE_TABLES = {
+    "prices_weather": ["zone_daily", "price_weather_sensitivity", "price_profile"],
+    "household_bill": ["household_bill_monthly"],
+}
 
 # Invented zone character: mean temperature, seasonal swing, mean wind, price level (NOK/kWh),
 # size of the 2022 spike, and how strongly price follows cold.
@@ -184,6 +201,41 @@ def profile(h: pd.DataFrame) -> pd.DataFrame:
     return p
 
 
+def household_bill(h: pd.DataFrame) -> pd.DataFrame:
+    """The same columns and rules as src/gold/household_bill.build_household_bill_monthly.
+    Every sample hour has a price and every day has 24 hours, so a month is final once it is over."""
+    keys = ["bidding_zone", "year", "month"]
+    h = h[h["local_date"] >= pd.Timestamp(BILL_START)]
+    spot = h["price_nok_kwh"]
+    with_vat = np.where(h["bidding_zone"].isin(NO_VAT_ZONES), 1.0, 1 + VAT)
+    kwh = BASE_LOAD_KWH + KWH_PER_HDH * h["hdh"].fillna(h.groupby(keys)["hdh"].transform("mean"))
+    norgespris = h["local_date"].between(pd.Timestamp(NORGESPRIS_FROM), pd.Timestamp(NORGESPRIS_TO))
+    h = h.assign(
+        kwh=kwh,
+        no_support=kwh * spot * with_vat,
+        support=kwh * STROMSTOTTE_SHARE * (spot - h["year"].map(STROMSTOTTE_THRESHOLD_NOK)).clip(lower=0) * with_vat,
+        norgespris=(kwh * NORGESPRIS_NOK * with_vat).where(norgespris),
+        temp_missing=h["hdh"].isna(),
+    )
+    m = h.groupby(keys, as_index=False).agg(
+        kwh=("kwh", "sum"), no_support=("no_support", "sum"), support=("support", "sum"),
+        norgespris=("norgespris", lambda s: s.sum(min_count=1)), price_hours=("price_nok_kwh", "count"),
+        billed_hours=("kwh", "count"), temp_filled_hours=("temp_missing", "sum"),
+    )
+    m["stromstotte"] = m["no_support"] - m["support"]
+    m["_without"] = m["no_support"]
+    b = m.melt(id_vars=keys + ["kwh", "_without", "price_hours", "billed_hours", "temp_filled_hours"],
+               value_vars=list(SCHEMES), var_name="scheme", value_name="cost_nok")
+    b = b[(b["scheme"] == SCHEME_NONE) | b["cost_nok"].notna()].copy()
+    b["avg_price_nok_kwh"] = (b["cost_nok"] / b["kwh"]).round(4)
+    b["support_nok"] = (b.pop("_without") - b["cost_nok"]).round(2)
+    b["kwh"], b["cost_nok"] = b["kwh"].round(2), b["cost_nok"].round(2)
+    b["hours_in_month"] = pd.to_datetime(dict(year=b["year"], month=b["month"], day=1)).dt.days_in_month * 24
+    b["is_final"] = b["billed_hours"] == b["hours_in_month"]
+    return b[keys + ["scheme", "kwh", "cost_nok", "avg_price_nok_kwh", "support_nok", "price_hours",
+                     "billed_hours", "temp_filled_hours", "hours_in_month", "is_final"]]
+
+
 def write(out: Path, tables, start: date, end: date) -> None:
     for name, df in tables.items():
         df = df.copy()
@@ -217,7 +269,7 @@ def write(out: Path, tables, start: date, end: date) -> None:
             "data_through": min(complete).isoformat(),
             "prices_through": min(prices).isoformat(),
         },
-        "use_cases": {"prices_weather": TABLES},
+        "use_cases": USE_CASE_TABLES,
         "checks": [],
         "is_sample": True,
     }
@@ -244,7 +296,7 @@ def main() -> int:
     hourly = make_hourly(start, end, args.seed)
     daily = zone_daily(hourly)
     tables = {"zone_daily": daily, "price_weather_sensitivity": sensitivity(hourly, daily),
-              "price_profile": profile(hourly)}
+              "price_profile": profile(hourly), "household_bill_monthly": household_bill(hourly)}
     write(args.output_dir, tables, start, end)
     print(f"Wrote sample Gold ({len(daily)} zone-days, {start} to {end}) to {args.output_dir}")
     return 0
