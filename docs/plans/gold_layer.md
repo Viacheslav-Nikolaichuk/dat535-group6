@@ -1,6 +1,9 @@
 # Gold layer and dashboard
 
-**Status:** use case 2 (dashboard: prices and weather) built on branch `feat/gold-dashboard` (31 Oct 2026). All tests pass in a Linux container (Python 3.11, Spark 3.5.0). It has not run on the VM yet. Use cases 1, 3 and 4 are planned, and the dashboard already has a placeholder page for each of them. The Data health page is planned too.
+**Status:**
+- Use case 2 (dashboard: prices and weather) is built and runs nightly in prod since 2 Nov 2026.
+- Use case 3 (report: monthly household bill) is built on branch `feat/gold-household-bill` (2 Nov 2026). All tests pass in a Linux container (Python 3.11, Spark 3.5.0). It has not run on the VM yet.
+- Use cases 1 and 4 are planned, each with a placeholder page in the dashboard. The Data health page is planned too.
 
 **Reads:** Silver's `zone_hourly` and `dim_date` ([silver_layer.md](silver_layer.md), section 4). The use cases themselves are in [use_cases.md](use_cases.md).
 
@@ -19,8 +22,12 @@ Silver answers "what does the data say, once cleaned?". Gold answers "what does 
 | G5 | The dashboard is **Streamlit**, reading Gold directly from disk on the VM. | Python only, with no build step and no separate API. Each use case is one page module. |
 | G6 | The dashboard binds to **127.0.0.1** and is opened through an **SSH tunnel**. | Nothing is public, and the OpenStack security group needs no change. |
 | G7 | Correlations and slopes use **complete days only** (every hour has a price and a temperature). | A day with gaps would bias its average. The days stay in `zone_daily`, and their hour counts show the gap ([use_cases.md](use_cases.md), 5.2). |
+| G8 | The price rules and the household live in **`config/price_rules.py`**, plain Python. | Gold, the sample generator and the dashboard's assumptions text share one copy, and the dashboard needs no Spark to read it. |
+| G9 | In the household bill, an hour **without a temperature uses the zone's average `hdh` that month**. | Otherwise one missing weather hour would keep a month preliminary for good. A month is final when every hour has a price; `temp_filled_hours` shows how many hours were filled. |
 
-## 3. Use case 2 tables
+## 3. Tables
+
+### Use case 2: prices and weather
 
 Prices are in NOK/kWh excluding VAT, as in Silver. The dashboard shows øre/kWh (NOK × 100). Dates are Norwegian local dates.
 
@@ -37,6 +44,26 @@ Rules:
 - **Seasons:** winter is October to March (the heating season), summer is April to September. **Day types:** `workday` and `weekend_holiday`.
 - On the autumn daylight saving day, 02:00 happens twice. Both hours count towards hour 2 in `price_profile`, and the day has 25 hours in `zone_daily`.
 
+### Use case 3: monthly household bill
+
+| Table | One row per | Main columns |
+|---|---|---|
+| `household_bill_monthly` | zone, Norwegian month and scheme (`no_support`, `stromstotte`, `norgespris`), from January 2024 | `kwh`, `cost_nok`, `avg_price_nok_kwh`, `support_nok`, `price_hours`, `billed_hours`, `temp_filled_hours`, `hours_in_month`, `is_final` |
+
+Rules (the values are in `config/price_rules.py`, from [use_cases.md](use_cases.md), section 9):
+- **Household:** every hour uses `0.6 + 0.1 × hdh` kWh. An hour without a temperature uses the zone's average `hdh` that month (G9). An hour without a price is not billed. If a zone has no temperature at all in a month, nothing can be billed yet: that month keeps its `no_support` row with its hours and no cost.
+- **Every scheme is priced hour by hour**, then summed per month:
+  - No support: spot × (1 + VAT).
+  - Strømstønad: the same, minus 0.9 × max(0, spot − threshold) × (1 + VAT).
+  - Norgespris: 0.40 × (1 + VAT).
+  - VAT is 25 %, 0 % in NO4.
+- **A scheme only has rows in months when it existed:**
+  - Norgespris from October 2025 to December 2026.
+  - Strømstønad in the years with a known threshold (2024–2026).
+- **`support_nok`** is the no-support bill minus this scheme's bill. For Norgespris it is negative when the spot price was below 0.40: the household then paid more.
+- **`is_final`:** every hour of the month was billed (`billed_hours = hours_in_month`, from `dim_date`: 743 in March, 745 in October). The month in progress is month to date. It becomes final with the run that brings in its last day, due by 06:00 on the 1st.
+- **Left out:** the grid tariff and the supplier's fees, which are the same under every scheme. The 5,000 kWh monthly cap is left out too; a check confirms the household stays below it.
+
 ## 4. Checks before writing
 
 All checks are hard: a failure writes nothing, exits with code 1, and the dashboard keeps the previous Gold.
@@ -48,8 +75,12 @@ All checks are hard: a failure writes nothing, exits with code 1, and the dashbo
 | `zone_daily` is not empty | An empty Silver must not replace a good Gold |
 | Σ `price_hours` in `zone_daily` equals Silver's count of `has_price` | No hour is lost or counted twice between Silver and Gold |
 | Correlations lie in [−1, 1] | A sanity check on the statistics |
+| Household bill: `price_hours` ≤ `hours_in_month` and `billed_hours` ≤ `price_hours` | A month can't have more hours than the calendar gives it |
+| Household bill: each zone-month's `price_hours` equals the sum in `zone_daily` | `zone_daily` already matches Silver, so no hour is lost or counted twice in the bill either |
+| Household bill: every Norgespris bill equals kWh × 0.40 × (1 + VAT) | The hourly pricing and the VAT per zone add up |
+| Household bill: no month above 5,000 kWh | The support cap we leave out never applies |
 
-The tests recompute the figures from hand-made hourly data. For example, a price that falls exactly 5 øre per degree must give a slope of 5.0 and a correlation of −1.
+The tests recompute the figures from hand-made hourly data. For example, a price that falls exactly 5 øre per degree must give a slope of 5.0 and a correlation of −1. For the bill, the worked example in [use_cases.md](use_cases.md), section 9 (NO1, 2026, spot 1.00 NOK: 1.25 with no support, 0.99 with strømstønad, 0.50 with Norgespris) is a test, and so are NO4 without VAT and the 743- and 745-hour months.
 
 ## 5. Freshness and readiness
 
@@ -82,6 +113,7 @@ dashboard/
 └── views/
     ├── overview.py        # home page: one card per use case
     ├── prices_weather.py  # use case 2
+    ├── household_bill.py  # use case 3
     └── planned.py         # placeholder for use cases that aren't built yet
 ```
 
@@ -97,6 +129,19 @@ dashboard/
   - the price over the day, workdays against weekends, per season.
 - Every chart has a table view or a legend. The zone colours pass the colour-blindness checks in light and dark mode.
 
+**The use case 3 page:**
+- **The report:**
+  - opens on the newest final month (last month);
+  - the bill in every zone under each scheme, and which scheme was cheaper;
+  - one sentence answering "was Norgespris cheaper?";
+  - a CSV download.
+- **Month by month, for one zone:**
+  - the bill under each scheme;
+  - what Norgespris saved compared with strømstønad;
+  - a table.
+- **The assumptions**, with the household's yearly kWh in that zone.
+- **Colours:** strømstønad and Norgespris reuse the workday/weekend colours (slots 6–7), and "no support" is the muted grey reference line. All pairs pass the same checks in both modes.
+
 **Adding a use case:**
 1. Build its Gold tables in `src/gold/<use_case>.py` and add them to `run_gold.py`, with key columns in `TABLE_KEYS` and the use case in `USE_CASE_TABLES`.
 2. Write `dashboard/views/<name>.py` with a `render()` function. Load the tables with `ui.load_tables([...])`.
@@ -104,6 +149,7 @@ dashboard/
 
 ## 7. What is left
 
-- ⏳ The first run on the VM: the `gold` job on `dev`, then Streamlit through the tunnel.
-- ⏳ Use cases 1, 3 and 4, and the Data health page ([use_cases.md](use_cases.md)).
+- ✅ The first run on the VM: Gold is built nightly in prod, and the dashboard runs through the tunnel.
+- ⏳ Use case 3 on the VM: the `gold` job on `dev`, then `main`.
+- ⏳ Use cases 1 and 4, and the Data health page ([use_cases.md](use_cases.md)).
 - ⏳ A note in the report on how a correlation is not a cause: hydropower reserves, gas prices and exports move prices too.
