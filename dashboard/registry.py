@@ -1,6 +1,6 @@
 """
-The list of pages the dashboard offers: the four Gold use cases (docs/plans/use_cases.md) and the shared
-Data health page.
+The list of pages the dashboard offers: the four Gold use cases (docs/plans/use_cases.md) and pages without a
+use case number, such as the API's documentation (listed under "More").
 
 The menu, the overview page and the placeholder pages are all built from this list. To add a use case:
   1. write dashboard/views/<name>.py with a `render()` function that draws the page;
@@ -57,10 +57,11 @@ USE_CASES = [
         question="When should I charge the car or run the dishwasher tomorrow, and what will it cost?",
         user="Household, smart charger",
         ready_by="14:30",
-        refresh="Daily, after tomorrow's prices are published (~13:00)",
-        gold_tables=("consumer_prices_hourly", "cheapest_hours", "cheapest_hours_tomorrow.json"),
-        status=PLANNED,
+        refresh="Daily, every 30 min after tomorrow's prices are published (~13:00)",
+        gold_tables=("consumer_prices_hourly", "cheapest_hours"),
+        status=READY,
         icon=":material/ev_station:",
+        view="dashboard.views.cheapest_hours",
     ),
     UseCase(
         key="monthly-bill",
@@ -88,5 +89,19 @@ USE_CASES = [
         gold_tables=("price_features", "price_outlook", "outlook_accuracy"),
         status=PLANNED,
         icon=":material/query_stats:",
+    ),
+    UseCase(
+        key="api",
+        number=None,
+        kind="For developers",
+        title="API for apps",
+        question="How can a car charger or a home-automation system get the cheapest hours by itself?",
+        user="Smart chargers, home automation, developers",
+        ready_by="14:30 for tomorrow's prices",
+        refresh="Follows Gold: the nightly and the afternoon runs",
+        gold_tables=("consumer_prices_hourly", "cheapest_hours"),
+        status=READY,
+        icon=":material/api:",
+        view="dashboard.views.api_docs",
     ),
 ]

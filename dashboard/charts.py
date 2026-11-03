@@ -78,7 +78,7 @@ def lines(
     y_fmt = ".1f"
     hover = alt.selection_point(nearest=True, on="pointerover", fields=[x], empty=False, clear="pointerout")
     if hour_of_day:
-        clock = f"(datum.{{v}} < 10 ? '0' : '') + datum.{{v}} + ':00'"
+        clock = "(datum.{v} < 10 ? '0' : '') + datum.{v} + ':00'"
         x_enc = alt.X(f"{x}:Q", title=x_title, scale=alt.Scale(domain=[0, 23], nice=False),
                       axis=alt.Axis(values=list(range(0, 24, 3)), labelExpr=clock.format(v="value")))
         x_tip = alt.Tooltip("clock:N", title=x_title or "Hour")
@@ -170,5 +170,32 @@ def columns(
         y=alt.Y(f"{y}:Q", title=y_title),
         tooltip=[alt.Tooltip(f"{x}:T", title="Month", format="%B %Y"),
                  alt.Tooltip(f"{y}:Q", title=y_title, format=".2f"), *tooltip_extra],
+    )
+    return zero_line(bars.properties(height=height))
+
+
+# The hours of one day (use case 1): the cheapest block in blue, the dearest hours in red, the rest in a
+# light grey that recedes. Blue and red pass the palette validator's checks as a pair in both modes;
+# the grey is set apart by lightness. The legend and the tooltip name every bar's role.
+HOUR_ROLE_COLORS_LIGHT = ["#2a78d6", "#d03b3b", "#c3c2b7"]
+HOUR_ROLE_COLORS_DARK = ["#3987e5", "#e66767", "#52514e"]
+
+
+def hour_bars(df: pd.DataFrame, roles: Sequence[str], y_title: str, height: int = 300) -> alt.LayerChart:
+    """One column per hour of a day, coloured by role (`roles`: cheapest, expensive, other, in that order).
+
+    df needs time (unique label per hour, in order), price_ore, role, spot_ore and with_vat_ore.
+    """
+    colors = HOUR_ROLE_COLORS_DARK if _dark() else HOUR_ROLE_COLORS_LIGHT
+    bars = alt.Chart(df).mark_bar(cornerRadiusEnd=4, size=22).encode(
+        x=alt.X("time:O", title=None, sort=list(df["time"]),
+                axis=alt.Axis(labelAngle=0, values=[t for t in df["time"] if t[:2] in ("00", "06", "12", "18")])),
+        y=alt.Y("price_ore:Q", title=y_title),
+        color=alt.Color("role:N", scale=_scale(roles, colors), legend=alt.Legend(orient="top", title=None)),
+        tooltip=[alt.Tooltip("time:O", title="Hour"),
+                 alt.Tooltip("price_ore:Q", title=y_title, format=".1f"),
+                 alt.Tooltip("role:N", title="This hour"),
+                 alt.Tooltip("spot_ore:Q", title="Spot price, without VAT (øre/kWh)", format=".1f"),
+                 alt.Tooltip("with_vat_ore:Q", title="With VAT, no support (øre/kWh)", format=".1f")],
     )
     return zero_line(bars.properties(height=height))

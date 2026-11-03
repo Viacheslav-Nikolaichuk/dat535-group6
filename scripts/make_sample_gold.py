@@ -6,8 +6,11 @@ spike in the south and cheap power in the north. Nothing here is real data.
 The tables have the same names and columns as src/gold/run_gold.py writes, and _status/latest.json
 says "is_sample": true, so the dashboard shows a "sample data" warning.
 
+Like real Gold after the afternoon day-ahead run, prices reach tomorrow and weather yesterday.
+
 Usage:
     python scripts/make_sample_gold.py                       # into <data root>/dev/gold
+    python scripts/make_sample_gold.py --without-tomorrow    # as before ~13:00: tomorrow not published yet
     python scripts/make_sample_gold.py --output-dir /tmp/gold_sample
     DAT535_GOLD_DIR=/tmp/gold_sample streamlit run dashboard/app.py
 """
@@ -45,6 +48,7 @@ from config.price_rules import (  # noqa: E402
 from config.settings import DAT535_ENV, GOLD_DIR, HISTORY_START  # noqa: E402
 
 USE_CASE_TABLES = {
+    "cheapest_hours": ["consumer_prices_hourly", "cheapest_hours"],
     "prices_weather": ["zone_daily", "price_weather_sensitivity", "price_profile"],
     "household_bill": ["household_bill_monthly"],
 }
@@ -60,6 +64,7 @@ ZONES = {
 }
 PEAK_START_HOUR, PEAK_END_HOUR, MIN_FIT_DAYS = 8, 20, 10
 WINTER_MONTHS = (10, 11, 12, 1, 2, 3)
+BLOCK_HOURS, EVENING_START_HOUR = (1, 3, 6), 17  # as in src/gold/cheapest_hours.py
 
 
 def holidays(years):
@@ -80,7 +85,8 @@ def ar1(rng, n, sigma, phi=0.8):
     return out
 
 
-def make_hourly(start: date, end: date, seed: int) -> pd.DataFrame:
+def make_hourly(start: date, end: date, seed: int, weather_until: date) -> pd.DataFrame:
+    """Hourly sample rows from start to end. Days from weather_until on have prices but no weather yet."""
     rng = np.random.default_rng(seed)
     days = pd.date_range(start, end, freq="D")
     n = len(days)
@@ -121,6 +127,7 @@ def make_hourly(start: date, end: date, seed: int) -> pd.DataFrame:
             "wind_speed_mps": hourly_wind.ravel().round(1),
         }))
     df = pd.concat(frames, ignore_index=True)
+    df.loc[df["local_date"] >= pd.Timestamp(weather_until), "temp_celsius"] = np.nan
     df.loc[df["temp_celsius"].isna(), "wind_speed_mps"] = np.nan
     df["hdh"] = (17.0 - df["temp_celsius"]).clip(lower=0)
     df["year"], df["month"] = df["local_date"].dt.year, df["local_date"].dt.month
@@ -146,7 +153,7 @@ def zone_daily(h: pd.DataFrame) -> pd.DataFrame:
     )
     d["peak_offpeak_ratio"] = (d["peak_avg_price_nok_kwh"] / d["offpeak_avg_price_nok_kwh"]).where(
         d["offpeak_avg_price_nok_kwh"] > 0).round(3)
-    d["hdd"] = (d.pop("hdh") / 24).round(2)
+    d["hdd"] = (d.pop("hdh") / 24).round(2).where(d["weather_hours"] > 0)  # Spark: a sum of nothing is empty
     d["hours_in_day"] = 24
     d["is_complete"] = (d["price_hours"] == 24) & (d["weather_hours"] == 24)
     d["year"], d["month"] = d["local_date"].dt.year, d["local_date"].dt.month
@@ -201,11 +208,12 @@ def profile(h: pd.DataFrame) -> pd.DataFrame:
     return p
 
 
-def household_bill(h: pd.DataFrame) -> pd.DataFrame:
-    """The same columns and rules as src/gold/household_bill.build_household_bill_monthly.
-    Every sample hour has a price and every day has 24 hours, so a month is final once it is over."""
+def household_bill(h: pd.DataFrame, bill_until: date) -> pd.DataFrame:
+    """The same columns and rules as src/gold/household_bill.build_household_bill_monthly, through the day
+    before bill_until. Every sample hour has a price and every day has 24 hours, so a month is final once
+    it is over."""
     keys = ["bidding_zone", "year", "month"]
-    h = h[h["local_date"] >= pd.Timestamp(BILL_START)]
+    h = h[(h["local_date"] >= pd.Timestamp(BILL_START)) & (h["local_date"] < pd.Timestamp(bill_until))]
     spot = h["price_nok_kwh"]
     with_vat = np.where(h["bidding_zone"].isin(NO_VAT_ZONES), 1.0, 1 + VAT)
     kwh = BASE_LOAD_KWH + KWH_PER_HDH * h["hdh"].fillna(h.groupby(keys)["hdh"].transform("mean"))
@@ -236,7 +244,67 @@ def household_bill(h: pd.DataFrame) -> pd.DataFrame:
                      "billed_hours", "temp_filled_hours", "hours_in_month", "is_final"]]
 
 
-def write(out: Path, tables, start: date, end: date) -> None:
+def consumer_prices(h: pd.DataFrame) -> pd.DataFrame:
+    """The same columns and rules as src/gold/cheapest_hours.build_consumer_prices_hourly."""
+    h = h[h["local_date"] >= pd.Timestamp(BILL_START)]
+    vat = pd.Series(np.where(h["bidding_zone"].isin(NO_VAT_ZONES), 0.0, VAT), index=h.index)
+    spot = h["price_nok_kwh"]
+    support = STROMSTOTTE_SHARE * (spot - h["year"].map(STROMSTOTTE_THRESHOLD_NOK)).clip(lower=0) * (1 + vat)
+    norgespris = h["local_date"].between(pd.Timestamp(NORGESPRIS_FROM), pd.Timestamp(NORGESPRIS_TO))
+    # UTC hours from the Norwegian clock. Sample days always have 24 hours, so the daylight saving days
+    # are approximate; nothing on the page depends on it.
+    local = h["local_date"] + pd.to_timedelta(h["local_hour"], unit="h")
+    utc = local.dt.tz_localize("Europe/Oslo", ambiguous=False, nonexistent="shift_forward").dt.tz_convert(None)
+    return pd.DataFrame({
+        "bidding_zone": h["bidding_zone"],
+        "utc_hour": utc,
+        "local_date": h["local_date"],
+        "local_hour": h["local_hour"],
+        "spot_nok_kwh": spot.round(5),
+        "vat_rate": vat,
+        "price_with_vat_nok_kwh": (spot * (1 + vat)).round(5),
+        "stromstotte_nok_kwh": support.round(5),
+        "price_with_stromstotte_nok_kwh": (spot * (1 + vat) - support).round(5),
+        "norgespris_nok_kwh": (NORGESPRIS_NOK * (1 + vat)).round(5).where(norgespris),
+        "year": h["year"],
+        "month": h["month"],
+    }).reset_index(drop=True)
+
+
+def cheapest_hours(cp: pd.DataFrame) -> pd.DataFrame:
+    """The same columns and rules as src/gold/cheapest_hours.build_cheapest_hours (sample days are complete)."""
+    day = ["bidding_zone", "local_date"]
+    cp = cp.sort_values(day + ["utc_hour"], ignore_index=True)
+    price = cp["price_with_stromstotte_nok_kwh"].fillna(cp["price_with_vat_nok_kwh"])
+    rows = []
+    for n in BLOCK_HOURS:
+        def ahead(values, n=n):  # the average of this hour and the next n - 1 in the same day
+            return values.groupby([cp[k] for k in day]).transform(lambda s: s.rolling(n).mean().shift(-(n - 1)))
+        blocks = cp[day + ["utc_hour", "local_hour", "year", "month"]].assign(
+            block_hours=n, _price=ahead(price), _spot=ahead(cp["spot_nok_kwh"])).dropna(subset=["_price"])
+        best = blocks.loc[blocks.groupby(day)["_price"].idxmin()]  # idxmin: the earliest of equal blocks
+        evening = blocks[blocks["local_hour"] == EVENING_START_HOUR].set_index(day)["_price"].rename("_evening")
+        rows.append(best.join(evening, on=day))
+    b = pd.concat(rows, ignore_index=True)
+    end = b["utc_hour"] + pd.to_timedelta(b["block_hours"], unit="h")
+    return pd.DataFrame({
+        "bidding_zone": b["bidding_zone"],
+        "local_date": b["local_date"],
+        "block_hours": b["block_hours"],
+        "start_utc": b["utc_hour"],
+        "end_utc": end,
+        "start_time": [f"{h:02d}:00" for h in b["local_hour"]],
+        "end_time": [f"{(h + n) % 24:02d}:00" for h, n in zip(b["local_hour"], b["block_hours"])],
+        "avg_spot_nok_kwh": b["_spot"].round(5),
+        "avg_price_nok_kwh": b["_price"].round(5),
+        "evening_avg_price_nok_kwh": b["_evening"].round(5),
+        "saving_nok_kwh": (b["_evening"] - b["_price"]).round(5),
+        "year": b["year"],
+        "month": b["month"],
+    }).sort_values(day + ["block_hours"], ignore_index=True)
+
+
+def write(out: Path, tables, start: date, end: date, today: date) -> None:
     for name, df in tables.items():
         df = df.copy()
         if "local_date" in df.columns:
@@ -249,10 +317,14 @@ def write(out: Path, tables, start: date, end: date) -> None:
         target.mkdir(parents=True)
         df.to_parquet(target / "part-00000-sample.parquet", index=False)
 
+    tomorrow = today + timedelta(days=1)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    blocks = tables["cheapest_hours"]
+    published = set(blocks.loc[blocks["local_date"] == pd.Timestamp(tomorrow), "bidding_zone"])
+
     daily = tables["zone_daily"]
     complete = daily[daily["is_complete"]].groupby("bidding_zone")["local_date"].max().dt.date
     prices = daily[daily["price_hours"] == daily["hours_in_day"]].groupby("bidding_zone")["local_date"].max().dt.date
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     status = {
         "run_id": "sample",
         "status": "SUCCESS",
@@ -269,6 +341,8 @@ def write(out: Path, tables, start: date, end: date) -> None:
             "data_through": min(complete).isoformat(),
             "prices_through": min(prices).isoformat(),
         },
+        "day_ahead": {"delivery_day": tomorrow.isoformat(),
+                      "published_zones": [z for z in ZONES if z in published]},
         "use_cases": USE_CASE_TABLES,
         "checks": [],
         "is_sample": True,
@@ -281,6 +355,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Write synthetic Gold tables for trying the dashboard")
     parser.add_argument("--output-dir", type=Path, default=GOLD_DIR, help=f"default {GOLD_DIR}")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--without-tomorrow", action="store_true",
+                        help="Leave tomorrow's prices out, as before they are published (~13:00)")
     args = parser.parse_args()
 
     if DAT535_ENV == "prod":
@@ -292,12 +368,15 @@ def main() -> int:
         return 2
 
     start = date.fromisoformat(HISTORY_START)
-    end = (datetime.now(timezone.utc) + timedelta(hours=1)).date() - timedelta(days=1)  # yesterday, Norway
-    hourly = make_hourly(start, end, args.seed)
+    today = (datetime.now(timezone.utc) + timedelta(hours=1)).date()  # Norway, near enough for sample data
+    end = today if args.without_tomorrow else today + timedelta(days=1)
+    hourly = make_hourly(start, end, args.seed, weather_until=today)
     daily = zone_daily(hourly)
-    tables = {"zone_daily": daily, "price_weather_sensitivity": sensitivity(hourly, daily),
-              "price_profile": profile(hourly), "household_bill_monthly": household_bill(hourly)}
-    write(args.output_dir, tables, start, end)
+    prices = consumer_prices(hourly)
+    tables = {"consumer_prices_hourly": prices, "cheapest_hours": cheapest_hours(prices),
+              "zone_daily": daily, "price_weather_sensitivity": sensitivity(hourly, daily),
+              "price_profile": profile(hourly), "household_bill_monthly": household_bill(hourly, bill_until=today)}
+    write(args.output_dir, tables, start, end, today)
     print(f"Wrote sample Gold ({len(daily)} zone-days, {start} to {end}) to {args.output_dir}")
     return 0
 
