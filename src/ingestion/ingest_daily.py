@@ -12,16 +12,20 @@ Usage:
     python src/ingestion/ingest_daily.py --lookback-days 3                 # Re-checks the last 3 days (catch-up)
     python src/ingestion/ingest_daily.py --start-date 2023-01-01 --end-date 2023-12-31 --request-delay 0.5
     python src/ingestion/ingest_daily.py --dry-run                         # Tests API without writing to disk
+    python src/ingestion/ingest_daily.py --day-ahead                       # Tomorrow's prices only (after ~13:00)
 """
 
 import argparse
 from datetime import date, datetime, timedelta, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import sys
 import time
 from typing import Dict, List, Optional
+
+from dateutil import tz
 
 # Ensure project root is on sys.path for direct script execution
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -57,6 +61,9 @@ WEATHER_TIME_RESOLUTIONS = ["PT1H"]
 EXIT_OK = 0
 EXIT_PARTIAL_FAILURE = 1
 EXIT_CONFIG_ERROR = 2
+EXIT_NOT_PUBLISHED = 3  # --day-ahead: tomorrow's prices aren't (all) published yet; try again later
+
+OSLO = tz.gettz("Europe/Oslo")
 
 
 def load_stations_config(config_path: Path = ZONES_CONFIG_FILE) -> Dict:
@@ -149,6 +156,21 @@ def resolve_target_dates(
 
     n_days = (end - start).days + 1
     return [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n_days)]
+
+
+def day_ahead_date(now_utc: Optional[datetime] = None) -> date:
+    """Tomorrow on the Norwegian clock: the day whose prices are published around 13:00 today."""
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(OSLO)
+    return now.date() + timedelta(days=1)
+
+
+def hours_in_oslo_day(day: date) -> int:
+    """23 on the spring daylight saving day, 25 on the autumn one, otherwise 24."""
+    nxt = day + timedelta(days=1)
+    # In UTC: Python subtracts two times in the same zone on the wall clock, which hides the clock change.
+    start = datetime(day.year, day.month, day.day, tzinfo=OSLO).astimezone(timezone.utc)
+    end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=OSLO).astimezone(timezone.utc)
+    return int((end - start).total_seconds() // 3600)
 
 
 # ---------------------------------------------------------------------- #
@@ -355,6 +377,124 @@ def run_ingestion(
     return EXIT_OK if not metrics["errors"] else EXIT_PARTIAL_FAILURE
 
 
+def _github_output(**values: str) -> None:
+    """Pass results to later workflow steps (no-op outside GitHub Actions)."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            for key, value in values.items():
+                f.write(f"{key}={value}\n")
+
+
+def run_day_ahead(
+    zones: Optional[List[str]] = None,
+    dry_run: bool = False,
+    output_dir: Optional[Path] = None,
+    strom_client: Optional[StromprisClient] = None,
+    now_utc: Optional[datetime] = None,
+) -> int:
+    """
+    Ingest tomorrow's (Norwegian) day-ahead prices for every zone. Prices only: tomorrow has no weather.
+
+    The price API publishes tomorrow around 13:00 and answers 404 before that. A zone counts as
+    published when its file has every hour of the day (23-25 with daylight saving). The files go to
+    Bronze like any other price file, so a rerun after publication skips them by checksum.
+
+    Returns:
+        0 when every zone is published, 3 when some aren't yet (not an error: retry later),
+        1 when a request failed for another reason.
+    """
+    start_time = time.time()
+    batch_id = generate_batch_id()
+    target_zones = [z.upper() for z in (zones or PRICE_ZONES)]
+    day = day_ahead_date(now_utc)
+    date_str, expected_hours = day.isoformat(), hours_in_oslo_day(day)
+
+    writer = BronzeWriter(bronze_dir=output_dir or BRONZE_DIR)
+    strom_client = strom_client or StromprisClient()
+
+    logger.info("=" * 65)
+    logger.info("STARTING DAY-AHEAD PRICE INGESTION")
+    logger.info(f"Environment:   {DAT535_ENV}")
+    logger.info(f"Run Batch ID:  {batch_id}")
+    logger.info(f"Delivery Day:  {date_str} (Norwegian, {expected_hours} hours)")
+    logger.info(f"Target Zones:  {', '.join(target_zones)}")
+    logger.info(f"Dry Run Mode:  {dry_run}")
+    logger.info("=" * 65)
+
+    metrics = _new_metrics(batch_id, [date_str])
+    not_published: List[str] = []
+    for zone in target_zones:
+        try:
+            res = strom_client.fetch_prices(date_str=date_str, zone=zone)
+        except FileNotFoundError:
+            logger.info(f"[NOT YET] [{zone}] {date_str}: not published yet")
+            not_published.append(zone)
+            continue
+        except Exception as e:
+            err_msg = f"electricity {zone} {date_str}: {e}"
+            logger.error(f"[FAIL] {err_msg}")
+            metrics["errors"].append(err_msg)
+            continue
+
+        records = res["records"]
+        metrics["electricity_records"] += len(records)
+        if len(records) != expected_hours:
+            # Bronze keeps what the API sent, but the day doesn't count as published.
+            logger.warning(f"[PARTIAL] [{zone}] {date_str}: {len(records)} of {expected_hours} hours")
+            not_published.append(zone)
+        if dry_run:
+            logger.info(f"[OK] [DRY RUN] [{zone}] Extracted {len(records)} prices")
+            continue
+        try:
+            result = writer.write_electricity_prices(
+                zone=zone, date_str=date_str, payload=records, source_uri=res["source_uri"], batch_id=batch_id
+            )
+            _record_write(metrics, result, f"[{zone}]", len(records), writer.bronze_dir)
+        except Exception as e:
+            err_msg = f"electricity {zone} {date_str}: {e}"
+            logger.error(f"[FAIL] {err_msg}")
+            metrics["errors"].append(err_msg)
+
+    published = not not_published and not metrics["errors"]
+    changed = bool(metrics["written_files"])
+    status = "SUCCESS" if published else ("NOT_PUBLISHED" if not metrics["errors"] else "COMPLETED_WITH_ERRORS")
+    elapsed = time.time() - start_time
+
+    logger.info("=" * 65)
+    logger.info(f"Status:          {status}")
+    logger.info(f"Execution Time:  {elapsed:.2f}s")
+    logger.info(f"Published:       {len(target_zones) - len(not_published)} of {len(target_zones)} zones")
+    logger.info(f"New files:       {len(metrics['written_files'])}")
+    logger.info("=" * 65)
+
+    # Retries before publication write nothing, so they leave no manifest either.
+    if not dry_run and (changed or metrics["errors"]):
+        writer.write_manifest({
+            "batch_id": batch_id,
+            "mode": "day_ahead",
+            "created_at_utc": get_utc_now_iso(),
+            "status": status,
+            "elapsed_seconds": round(elapsed, 2),
+            "date_from": date_str,
+            "date_to": date_str,
+            "days_count": 1,
+            "electricity_records": metrics["electricity_records"],
+            "weather_records": 0,
+            "files": metrics["files"],
+            "synthetic_files": 0,
+            "written_files": metrics["written_files"],
+            "empty_payloads": metrics["empty_payloads"],
+            "not_published": not_published,
+            "errors": metrics["errors"],
+        })
+    _github_output(delivery_day=date_str, published=str(published).lower(), changed=str(changed).lower())
+
+    if metrics["errors"]:
+        return EXIT_PARTIAL_FAILURE
+    return EXIT_OK if published else EXIT_NOT_PUBLISHED
+
+
 def run_daily_ingestion(
     target_date: Optional[str] = None,
     zones: Optional[List[str]] = None,
@@ -404,6 +544,11 @@ def main() -> int:
         help="Re-check the N complete days ending yesterday (catches missed runs and late revisions)",
     )
     parser.add_argument(
+        "--day-ahead",
+        action="store_true",
+        help="Ingest tomorrow's prices only (Norwegian date; published around 13:00). Exit code 3: not yet",
+    )
+    parser.add_argument(
         "--zones",
         nargs="+",
         choices=PRICE_ZONES,
@@ -428,6 +573,11 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+
+    if args.day_ahead:
+        if args.date or args.start_date or args.end_date or args.lookback_days is not None:
+            parser.error("--day-ahead can't be combined with --date, --start-date/--end-date or --lookback-days.")
+        return run_day_ahead(zones=args.zones, dry_run=args.dry_run)
 
     try:
         dates = resolve_target_dates(
