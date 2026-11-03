@@ -10,6 +10,7 @@ Every run rebuilds all Gold tables from the newest successful Silver (docs/plans
   5. write gold/_status/latest.json, which tells the dashboard how fresh Gold is
 
 Tables land in <data root>/<env>/gold/:
+  use case 1 (application): consumer_prices_hourly, cheapest_hours (served to apps by api/main.py)
   use case 2 (dashboard): zone_daily, price_weather_sensitivity, price_profile
   use case 3 (report): household_bill_monthly
   status: _status/latest.json (newest successful run), _status/runs/run__<run_id>.json (every run)
@@ -17,9 +18,13 @@ Tables land in <data root>/<env>/gold/:
 Usage:
     python src/gold/run_gold.py
     python src/gold/run_gold.py --silver-dir /tmp/silver_clean --output-dir /tmp/gold_clean
+
+"Today" is the Norwegian date when Gold runs: tomorrow's prices (use case 1) are the day after it, and the
+household bill (use case 3) covers the days before it.
 """
 
 import argparse
+from datetime import date, datetime, timedelta, timezone
 from functools import reduce
 import json
 import logging
@@ -29,6 +34,8 @@ import shutil
 import sys
 import time
 from typing import Dict, List, Optional
+
+from dateutil import tz
 
 # Ensure project root is on sys.path for direct script execution
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -46,12 +53,18 @@ from config.price_rules import (  # noqa: E402
     SUPPORT_CAP_KWH,
 )
 from config.settings import DAT535_ENV, GOLD_DIR, PRICE_ZONES, SILVER_DIR  # noqa: E402
+from src.gold.cheapest_hours import (  # noqa: E402
+    BLOCK_HOURS,
+    build_cheapest_hours,
+    build_consumer_prices_hourly,
+    published_zones,
+)
 from src.gold.dashboard import (  # noqa: E402
     build_price_profile,
     build_price_weather_sensitivity,
     build_zone_daily,
 )
-from src.gold.household_bill import build_household_bill_monthly, vat_rate  # noqa: E402
+from src.gold.household_bill import bill_days, build_household_bill_monthly, vat_rate  # noqa: E402
 from src.ingestion.bronze_writer import BronzeWriter  # noqa: E402
 from src.silver.quality import Check, check_dicts  # noqa: E402
 from src.silver.run_silver import STAGING_DIR, publish, write_table  # noqa: E402
@@ -66,6 +79,8 @@ EXIT_CONFIG_ERROR = 2
 
 # Key columns per table. Gold tables are small (thousands of rows), so each is one Parquet file.
 TABLE_KEYS = {
+    "consumer_prices_hourly": ["bidding_zone", "utc_hour"],
+    "cheapest_hours": ["bidding_zone", "local_date", "block_hours"],
     "zone_daily": ["bidding_zone", "local_date"],
     "price_weather_sensitivity": ["bidding_zone", "year", "month"],
     "price_profile": ["bidding_zone", "year", "season", "day_type", "local_hour"],
@@ -74,12 +89,19 @@ TABLE_KEYS = {
 
 # Which tables each use case reads; the dashboard's registry names the same tables.
 USE_CASE_TABLES = {
+    "cheapest_hours": ["consumer_prices_hourly", "cheapest_hours"],
     "prices_weather": ["zone_daily", "price_weather_sensitivity", "price_profile"],
     "household_bill": ["household_bill_monthly"],
 }
 
 STATUS_DIR = "_status"
 LATEST_STATUS = "latest.json"
+
+OSLO = tz.gettz("Europe/Oslo")
+
+
+def oslo_today() -> date:
+    return datetime.now(timezone.utc).astimezone(OSLO).date()
 
 
 def latest_silver_run(silver_dir: Path) -> Optional[Dict]:
@@ -94,7 +116,7 @@ def latest_silver_run(silver_dir: Path) -> Optional[Dict]:
     return max(successful, key=lambda m: m.get("finished_at_utc", ""), default=None)
 
 
-def run_checks(tables: Dict[str, DataFrame], silver_price_hours: int) -> List[Check]:
+def run_checks(tables: Dict[str, DataFrame], silver_price_hours: int, bill_until: Optional[date] = None) -> List[Check]:
     """Hard checks on the finished tables, before anything is written."""
     checks = []
     for name, keys in TABLE_KEYS.items():
@@ -131,10 +153,49 @@ def run_checks(tables: Dict[str, DataFrame], silver_price_hours: int) -> List[Ch
     ).count()
     checks.append(Check("price_weather_sensitivity.correlation_range", True, bad_corr == 0, float(bad_corr),
                         "correlations outside [-1, 1]"))
-    return checks + household_bill_checks(tables["household_bill_monthly"], daily)
+    return (
+        checks
+        + cheapest_hours_checks(tables["consumer_prices_hourly"], tables["cheapest_hours"], daily)
+        + household_bill_checks(tables["household_bill_monthly"], daily, bill_until)
+    )
 
 
-def household_bill_checks(bill: DataFrame, zone_daily: DataFrame) -> List[Check]:
+def cheapest_hours_checks(consumer_prices: DataFrame, cheapest: DataFrame, zone_daily: DataFrame) -> List[Check]:
+    """Use case 1: no hour lost, the prices follow the rules, and every complete day has its blocks."""
+    from_start = zone_daily.filter(F.col("local_date") >= BILL_START)
+    expected_hours = from_start.agg(F.sum("price_hours")).first()[0] or 0
+    hours = consumer_prices.count()
+
+    with_vat = F.col("spot_nok_kwh") * (1 + F.col("vat_rate"))
+    off_rules = consumer_prices.filter(
+        (F.abs(F.col("price_with_vat_nok_kwh") - with_vat) > 1e-4)
+        | (F.col("stromstotte_nok_kwh") < 0)
+        | (F.col("price_with_stromstotte_nok_kwh") > F.col("price_with_vat_nok_kwh") + 1e-5)
+    ).count()
+
+    complete_days = from_start.filter(F.col("price_hours") == F.col("hours_in_day")).count()
+    blocks = cheapest.count()
+    dearer = cheapest.filter(F.col("saving_nok_kwh") < -1e-5).count()
+    wrong_length = cheapest.filter(
+        F.col("end_utc").cast("long") - F.col("start_utc").cast("long") != F.col("block_hours") * 3600
+    ).count()
+
+    return [
+        Check("consumer_prices_hourly.hours_match_zone_daily", True, hours == expected_hours,
+              float(hours - expected_hours), f"{hours} priced hours, zone_daily has {expected_hours} since {BILL_START}"),
+        Check("consumer_prices_hourly.price_rules", True, off_rules == 0, float(off_rules),
+              "hours where VAT, strømstønad or the price after it don't follow the rules"),
+        Check("cheapest_hours.blocks_per_complete_day", True, blocks == complete_days * len(BLOCK_HOURS),
+              float(blocks - complete_days * len(BLOCK_HOURS)),
+              f"{blocks} blocks for {complete_days} complete zone-days x {len(BLOCK_HOURS)} lengths"),
+        Check("cheapest_hours.not_dearer_than_evening", True, dearer == 0, float(dearer),
+              "cheapest blocks dearer than the block starting at 17:00"),
+        Check("cheapest_hours.block_length", True, wrong_length == 0, float(wrong_length),
+              "blocks whose end isn't block_hours after their start"),
+    ]
+
+
+def household_bill_checks(bill: DataFrame, zone_daily: DataFrame, bill_until: Optional[date] = None) -> List[Check]:
     """Use case 3: the month's hours add up, and the bills follow the price rules."""
     keys = ["bidding_zone", "year", "month"]
     month_length = F.col("hours_in_month")
@@ -146,7 +207,7 @@ def household_bill_checks(bill: DataFrame, zone_daily: DataFrame) -> List[Check]
 
     # zone_daily already matches Silver's price hours, so each month's bill must match zone_daily.
     expected = (
-        zone_daily.filter(F.col("local_date") >= BILL_START)
+        zone_daily.filter(bill_days(F.col("local_date"), bill_until))
         .groupBy(*keys).agg(F.sum("price_hours").alias("expected_hours"))
     )
     billed = bill.filter(F.col("scheme") == SCHEME_NONE).select(*keys, "price_hours")
@@ -216,6 +277,10 @@ def step_summary(status: Dict) -> str:
         f"| Data through (all zones complete) | {fresh.get('data_through') or '–'} |",
         f"| Prices through | {fresh.get('prices_through') or '–'} |",
     ]
+    ahead = status.get("day_ahead")
+    if ahead:
+        zones = ", ".join(ahead["published_zones"]) or "none yet"
+        lines.append(f"| Tomorrow ({ahead['delivery_day']}): zones published | {zones} |")
     lines += [f"| Rows: {name} | {t['rows']} |" for name, t in status["tables"].items()]
     lines += ["", "| Check | Passed | Value | Detail |", "|---|---|---|---|"]
     lines += [f"| {c['name']} | {'✅' if c['passed'] else '❌'} | {c['value']:g} | {c['detail']} |" for c in status["checks"]]
@@ -226,9 +291,13 @@ def run_gold(
     silver_dir: Path,
     output_dir: Path,
     spark: Optional[SparkSession] = None,
+    today: Optional[date] = None,
 ) -> int:
     """
     Rebuild every Gold table from the Silver tables in `silver_dir` into `output_dir`.
+
+    `today` (Norwegian date, default: now) decides which day is "tomorrow" for use case 1 and where the
+    household bill stops.
 
     Returns:
         0 when the tables were written, 1 when a hard check failed (nothing written),
@@ -238,6 +307,8 @@ def run_gold(
     run_id = generate_batch_id()
     started_at = get_utc_now_iso()
     silver_dir, output_dir = Path(silver_dir), Path(output_dir)
+    today = today or oslo_today()
+    tomorrow = today + timedelta(days=1)
 
     silver_run = latest_silver_run(silver_dir)
     if silver_run is None or not (silver_dir / "zone_hourly").is_dir():
@@ -259,15 +330,18 @@ def run_gold(
     zone_hourly = spark.read.parquet(str(silver_dir / "zone_hourly")).cache()
     dim_date = spark.read.parquet(str(silver_dir / "dim_date"))
     zone_daily = build_zone_daily(zone_hourly, dim_date).cache()
+    consumer_prices = build_consumer_prices_hourly(zone_hourly).cache()
     tables = {
+        "consumer_prices_hourly": consumer_prices,
+        "cheapest_hours": build_cheapest_hours(consumer_prices, dim_date).cache(),
         "zone_daily": zone_daily,
         "price_weather_sensitivity": build_price_weather_sensitivity(zone_hourly, zone_daily).cache(),
         "price_profile": build_price_profile(zone_hourly).cache(),
-        "household_bill_monthly": build_household_bill_monthly(zone_hourly, dim_date).cache(),
+        "household_bill_monthly": build_household_bill_monthly(zone_hourly, dim_date, bill_until=today).cache(),
     }
 
     # 3. Checks, before anything is written.
-    checks = run_checks(tables, silver_price_hours=zone_hourly.filter(F.col("has_price")).count())
+    checks = run_checks(tables, silver_price_hours=zone_hourly.filter(F.col("has_price")).count(), bill_until=today)
     failed = [c for c in checks if c.hard and not c.passed]
 
     bounds = zone_daily.agg(F.min("local_date").alias("first"), F.max("local_date").alias("last")).first()
@@ -285,6 +359,9 @@ def run_gold(
         "first_date": bounds["first"].isoformat() if bounds["first"] else None,
         "last_date": bounds["last"].isoformat() if bounds["last"] else None,
         "freshness": freshness(zone_daily),
+        # Which zones have tomorrow: what the day-ahead run brought in, read by the dashboard and the API.
+        "day_ahead": {"delivery_day": tomorrow.isoformat(),
+                      "published_zones": published_zones(tables["cheapest_hours"], tomorrow)},
         "use_cases": USE_CASE_TABLES,
         "checks": check_dicts(checks),
         "is_sample": False,
@@ -315,6 +392,7 @@ def run_gold(
     for name, t in status["tables"].items():
         logger.info(f"Rows {name + ':':<27} {t['rows']}")
     logger.info(f"Data through:    {status['freshness']['data_through']}")
+    logger.info(f"Tomorrow:        {tomorrow} ({', '.join(status['day_ahead']['published_zones']) or 'not published yet'})")
     logger.info(f"Status file:     {path}")
     logger.info("=" * 65)
 
