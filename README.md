@@ -12,6 +12,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   └── workflows/
 │       ├── ci.yml                         # All unit tests incl. Spark on GitHub-hosted runners (push to dev, PRs to dev/main)
 │       ├── pipeline.yml                   # Bronze -> chaos copy -> Silver -> Gold on the VM runner (cron 02:17 UTC on main = prod; manual on dev = dev)
+│       ├── day_ahead.yml                  # Tomorrow's prices -> chaos copy -> Silver -> Gold, every 30 min in the afternoon (main = prod)
 │       └── backfill.yml                   # Manual historical Bronze backfill on the VM runner (main = prod, dev = dev)
 ├── config/
 │   ├── settings.py                        # dev/prod environment, data paths, env loader, and API base settings
@@ -23,7 +24,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   │   ├── strompris_client.py            # Hva Koster Strømmen API extractor
 │   │   ├── frost_client.py                # MET Norway Frost API extractor (auth & error handling)
 │   │   ├── bronze_writer.py               # Metadata audit envelopes & versioned, checksum-deduplicated JSON storage
-│   │   ├── ingest_daily.py                # Ingestion entrypoint CLI (daily, lookback catch-up, backfill)
+│   │   ├── ingest_daily.py                # Ingestion entrypoint CLI (daily, lookback catch-up, backfill, day-ahead)
 │   │   └── backfill_historical.py         # Historical backfill CLI: month-by-month, resumable, outside the daily window
 │   │   └── chaos_injector.py              # Builds bronze_chaos/: a Bronze copy with ~1% injected errors
 │   ├── silver/
@@ -37,29 +38,35 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   │   └── quality.py                     # Issue log (DLQ), checks, scorecard, chaos score, run manifest
 │   ├── gold/
 │   │   ├── run_gold.py                    # Gold entrypoint CLI: rebuilds the Gold tables, checks, status file
+│   │   ├── cheapest_hours.py              # Use case 1 tables: consumer_prices_hourly, cheapest_hours
 │   │   ├── dashboard.py                   # Use case 2 tables: zone_daily, price_weather_sensitivity, price_profile
 │   │   └── household_bill.py              # Use case 3 table: household_bill_monthly
 │   └── utils/
 │       ├── hashing.py                     # Batch UUID4, ISO-8601 UTC, and SHA-256 payload checksums
 │       └── http.py                        # Shared requests.Session with retry/backoff & User-Agent
+├── api/                                   # HTTP API for apps and smart chargers (use case 1; guide: docs/api.md)
+│   ├── main.py                            # FastAPI endpoints (open, no generated docs): cheapest hours, health, zones
+│   └── gold.py                            # Reads the Gold tables (cached) and builds every answer; the dashboard reuses it
 ├── dashboard/                             # Streamlit dashboard over Gold (see Dashboard below)
 │   ├── app.py                             # Entry point: menu from registry.py, sidebar data status
 │   ├── registry.py                        # The use cases: question, user, deadline, status, page module
 │   ├── data.py / ui.py / charts.py        # Reading Gold (pandas), cached loading, Altair charts
-│   └── views/                             # One page per use case (prices_weather.py, household_bill.py) + overview and placeholder
+│   └── views/                             # One page per use case (cheapest_hours.py, prices_weather.py, household_bill.py), the API page (api_docs.py), overview, placeholder
 ├── deploy/
-│   └── dat535-dashboard.service           # systemd unit that keeps the dashboard running on the VM
+│   ├── dat535-dashboard.service           # systemd unit that keeps the dashboard running on the VM
+│   └── dat535-api.service                 # systemd unit that keeps the cheapest hours API running on the VM
 ├── scripts/
 │   ├── test_api_connections.py            # Diagnostic smoke-test for API connectivity & credentials
 │   └── make_sample_gold.py                # Synthetic Gold tables for trying the dashboard without the VM
 ├── tests/
 │   ├── test_ingestion.py                  # PyTest suite for hashing, envelopes, versioning, CLI dates, and clients
 │   └── test_backfill.py                   # PyTest suite for the historical backfill (monthly runs, resume, date guard)
+│   └── test_day_ahead.py                  # PyTest suite for the day-ahead price run (tomorrow in Norway, not yet published)
 │   └── test_chaos.py                      # PyTest suite for chaos injection (rates, determinism, Bronze untouched)
 │   └── test_settings.py                   # PyTest suite for dev/prod environment and data path resolution
 │   └── conftest.py                        # Shared fixtures: local SparkSession, Bronze builders shaped like the APIs
 │   └── test_silver_*.py                   # Spark tests (marker `spark`): reader, prices, weather, zone_hourly, end-to-end runs
-│   └── test_gold_*.py                     # Spark tests: use case 2 and 3 tables, Bronze -> Silver -> Gold end-to-end
+│   └── test_gold_*.py                     # Spark tests: use case 1, 2 and 3 tables, Bronze -> Silver -> Gold end-to-end
 │   └── test_dashboard_data.py             # Dashboard helpers and the sample generator (pandas, no Spark)
 ├── labs/                                  # Archived course laboratory materials (Lab 1, 2, 3)
 │   ├── lab1_1_setup_guide.md
@@ -214,11 +221,16 @@ python src/ingestion/ingest_daily.py --date 2024-01-15 --dry-run
 # 6. Build/extend the chaos copy of Bronze (default: 1% errors, seed 42)
 python src/ingestion/chaos_injector.py
 python src/ingestion/chaos_injector.py --rate 0.02 --seed 7
+
+# 7. Day-ahead: tomorrow's prices only (Norwegian date; exit code 3 = not published yet, try later)
+python src/ingestion/ingest_daily.py --day-ahead
 ```
 
 ### Running on the VM Runner via GitHub Actions
 
 The workflow `.github/workflows/pipeline.yml` runs automatically on the self-hosted runner. It has four jobs, each starting only after the previous one succeeds: `bronze` (ingestion), `bronze_chaos` (extends `/bronze_chaos/` with the newly ingested files), `silver` (rebuilds the Silver tables, see [Silver Layer](#silver-layer)) and `gold` (rebuilds the Gold tables, see [Gold Layer & Dashboard](#gold-layer--dashboard)). The last three are skipped on dry runs. Runs from `main` write to `prod/`, runs from `dev` to `dev/` (see [Environments](#environments)).
+
+**Day-ahead run** (`.github/workflows/day_ahead.yml`, use case 1). Tomorrow's prices are published around 13:00 Norwegian time, and the cheapest-hours page promises them by 14:30. GitHub's schedule tries every 30 minutes from 11:07 to 15:37 UTC (12:07–16:37 Norwegian winter time, an hour later in summer), off the hour because GitHub delays scheduled runs most at the start of each hour. Each try runs `ingest_daily.py --day-ahead`; before publication it ends after five API calls. When new price files arrive, or tomorrow is published but Gold doesn't have it yet, it runs `bronze_chaos` → `silver` → `gold` like the nightly run. It shares the nightly run's lock, so the two never write the same environment at once. It can also be started by hand (**Actions** → **Day-ahead Prices** → **Run workflow**).
 
 1. **Schedule**: Daily at `02:17 UTC` (cron `17 2 * * *`), automatically running a 3-day lookback catch-up. GitHub only runs scheduled workflows from the default branch, so the schedule is active once the workflow is on `main` (prod). GitHub can start scheduled runs late, especially at the start of an hour, so the cron avoids minute 0. At `0 2 * * *` the runs started 5.5–7 hours late.
 2. **Quality Gate**: Runs the unit test suite without the Spark tests (`pytest -q -m "not spark"`) automatically prior to executing ingestion; CI runs the Spark tests.
@@ -298,10 +310,12 @@ python src/gold/run_gold.py --silver-dir /tmp/silver_clean --output-dir /tmp/gol
 | `zone_daily` | zone and Norwegian day | Average/min/max price, volatility, peak vs off-peak, negative hours, temperature, heating degree days, wind, hour counts, `is_complete` |
 | `price_weather_sensitivity` | zone and month | Monthly averages, and the correlation and slope of the daily price on temperature and wind (complete days only) |
 | `price_profile` | zone, year, season, day type, hour | Average price per Norwegian hour, for workdays vs weekends/holidays and winter vs summer |
+| `consumer_prices_hourly` | zone and hour (from 2024) | Spot price, VAT, strømstønad and the price after it, the Norgespris price: what a household pays for energy |
+| `cheapest_hours` | zone, Norwegian day and block length (1, 3, 6 h) | The cheapest block's start and end, its average household price, the block starting at 17:00, and the saving per kWh |
 | `household_bill_monthly` | zone, month and scheme (from 2024) | A modelled household's kWh and bill with no support, strømstønad and Norgespris, support received, `is_final` |
 | `_status/latest.json` | newest successful run | When Gold was built, from which Silver run, rows, `data_through` (newest day complete in every zone), checks |
 
-* **Checks before writing**: no duplicate or empty keys, no day longer than its 23/24/25 hours, a non-empty `zone_daily`, the same number of price hours as Silver, correlations in [−1, 1], and for the household bill: no month longer than its hours, each month's price hours equal to `zone_daily`, Norgespris bills equal to kWh × 0.40 plus VAT, and no month above the 5,000 kWh support cap. A failed check writes nothing (exit code 1), and the dashboard keeps showing the previous Gold. Every run also writes `_status/runs/run__<id>.json`.
+* **Checks before writing**: no duplicate or empty keys, no day longer than its 23/24/25 hours, a non-empty `zone_daily`, the same number of price hours as Silver, correlations in [−1, 1], for the cheapest hours: as many priced hours as `zone_daily`, prices that follow the VAT and strømstønad rules, three blocks per complete day, no block dearer than starting at 17:00, and for the household bill (which covers the days before Gold runs): no month longer than its hours, each month's price hours equal to `zone_daily`, Norgespris bills equal to kWh × 0.40 plus VAT, and no month above the 5,000 kWh support cap. A failed check writes nothing (exit code 1), and the dashboard keeps showing the previous Gold. Every run also writes `_status/runs/run__<id>.json`.
 
 ### Dashboard
 
@@ -330,6 +344,16 @@ ssh -L 8501:localhost:8501 ubuntu@<vm floating ip>
 ```
 
 To keep it running after you log out, use the systemd unit in [deploy/dat535-dashboard.service](deploy/dat535-dashboard.service). It runs the dashboard from its own clone, because the Actions runner replaces its work folder on every run. `DAT535_GOLD_DIR` points the dashboard at any other Gold folder.
+
+### Cheapest hours API
+
+Apps and smart chargers get use case 1 as JSON from a small, open (no key) FastAPI app, [api/main.py](api/main.py), instead of reading the dashboard. For example, `GET /api/v1/cheapest-hours/NO1/block?hours=6&day=tomorrow` says when the cheapest 6 hours of tomorrow start and end. Before tomorrow's prices are published it answers `503` with a `Retry-After` header.
+
+```bash
+uvicorn api.main:app --port 8000          # http://localhost:8000/ lists the endpoints
+```
+
+On the VM it runs as a service next to the dashboard ([deploy/dat535-api.service](deploy/dat535-api.service)), on `127.0.0.1:8000`, reached through the same SSH tunnel (`-L 8000:localhost:8000`). Its documentation for people is the dashboard's **API for apps** page, with a try-it panel that shows the exact answers. The full guide, with how to make it reachable from the internet and examples for a charger and Home Assistant, is **[docs/api.md](docs/api.md)**.
 
 ---
 

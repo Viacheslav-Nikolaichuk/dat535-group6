@@ -3,7 +3,8 @@
 **Status:**
 - Use case 2 (dashboard: prices and weather) is built and runs nightly in prod since 2 Nov 2026.
 - Use case 3 (report: monthly household bill) is built on branch `feat/gold-household-bill` (2 Nov 2026). All tests pass in a Linux container (Python 3.11, Spark 3.5.0). It has not run on the VM yet.
-- Use cases 1 and 4 are planned, each with a placeholder page in the dashboard. The Data health page is planned too.
+- Use case 1 (application: cheapest hours tomorrow) is built on branch `feat/gold-cheapest-hours` (3 Nov 2026), with the day-ahead price run it needs. All tests pass in a Linux container (Python 3.11, Spark 3.5.0). It has not run on the VM yet.
+- Use case 4 is planned, with a placeholder page in the dashboard. The Data health page is planned too.
 
 **Reads:** Silver's `zone_hourly` and `dim_date` ([silver_layer.md](silver_layer.md), section 4). The use cases themselves are in [use_cases.md](use_cases.md).
 
@@ -24,6 +25,10 @@ Silver answers "what does the data say, once cleaned?". Gold answers "what does 
 | G7 | Correlations and slopes use **complete days only** (every hour has a price and a temperature). | A day with gaps would bias its average. The days stay in `zone_daily`, and their hour counts show the gap ([use_cases.md](use_cases.md), 5.2). |
 | G8 | The price rules and the household live in **`config/price_rules.py`**, plain Python. | Gold, the sample generator and the dashboard's assumptions text share one copy, and the dashboard needs no Spark to read it. |
 | G9 | In the household bill, an hour **without a temperature uses the zone's average `hdh` that month**. | Otherwise one missing weather hour would keep a month preliminary for good. A month is final when every hour has a price; `temp_filled_hours` shows how many hours were filled. |
+| G10 | Tomorrow's prices come from a **separate afternoon workflow**, `day_ahead.yml`, started by **GitHub's schedule** every 30 minutes, off the hour. | Prices are published around 13:00, and use case 1 promises them by 14:30. The nightly run only collects finished days. GitHub may start scheduled runs late (section 5); we accept that and the page says when tomorrow is late. A timer on the VM would be more punctual, but it adds a token on the VM and runs outside Actions. |
+| G11 | Cheapest blocks are ranked by the **price a household pays after strømstønad**, not by the spot price. | Strømstønad keeps the order of single hours but flattens the expensive ones, so the cheapest block on average can differ: 0, 3, 0 NOK beats 0.9, 0.9, 0.9 after strømstønad, though not on spot. A test checks exactly that case. |
+| G12 | The household bill covers the **days before Gold runs**. | With the day-ahead run, Silver has today's and tomorrow's prices but no weather for them. Billing them would use estimated heating and make a month final on its second-to-last day. |
+| G13 | Apps get use case 1 from an **HTTP API** (`api/main.py`, FastAPI), not from a file. | An API can answer for today and tomorrow, so a charger asking after midnight still gets tonight's hours; a file written by Gold only held tomorrow. Its `503` with `Retry-After` tells a device when to ask again. It reads the Gold tables directly, so there is one source for the page and the API. It is open (no key, read-only: the data is public prices) and has no generated Swagger docs; the dashboard's "API for apps" page documents it with a try-it panel built on the same functions (`api/gold.py`). Guide: [docs/api.md](../api.md). |
 
 ## 3. Tables
 
@@ -43,6 +48,20 @@ Rules:
 - **Slope:** a least-squares fit of the daily average price on the daily average temperature (or wind) over the month's complete days, computed as `covar_samp / var_samp`. `ore_per_degree_colder` is the negative of the temperature slope, in øre: "+4 øre per degree colder". It is empty when a month has fewer than 10 complete days, or the weather didn't vary.
 - **Seasons:** winter is October to March (the heating season), summer is April to September. **Day types:** `workday` and `weekend_holiday`.
 - On the autumn daylight saving day, 02:00 happens twice. Both hours count towards hour 2 in `price_profile`, and the day has 25 hours in `zone_daily`.
+
+### Use case 1: cheapest hours tomorrow
+
+| Table | One row per | Main columns |
+|---|---|---|
+| `consumer_prices_hourly` | zone and hour with a price, from January 2024 | `spot_nok_kwh`, `vat_rate`, `price_with_vat_nok_kwh`, `stromstotte_nok_kwh`, `price_with_stromstotte_nok_kwh`, `norgespris_nok_kwh`, `local_date`, `local_hour` |
+| `cheapest_hours` | zone, complete Norwegian day and block length (1, 3, 6 hours) | `start_utc`, `end_utc`, `start_time`, `end_time` (Norwegian clock), `avg_spot_nok_kwh`, `avg_price_nok_kwh` (household price), `evening_avg_price_nok_kwh` (the block starting at 17:00), `saving_nok_kwh` |
+
+Rules (the price rules are the household bill's, in `config/price_rules.py`):
+- **Household price:** the price after strømstønad; in a year without a known threshold, the price with VAT. Blocks are ranked by it (G11). Ties go to the earliest start.
+- **Complete days only:** a day gets blocks when every hour has a price (23–25 with daylight saving). A zone whose tomorrow isn't complete is left out of `day_ahead.published_zones` in `latest.json`, and the API answers 503 for it.
+- **Blocks stay within one Norwegian day**, so a 6-hour block can't run past midnight.
+- **Norgespris:** every hour costs the same, so moving usage saves nothing; the page says so instead of recommending hours.
+- **Tomorrow** is the day after the Norwegian date when Gold runs (the `today` parameter of `run_gold`, which the tests set).
 
 ### Use case 3: monthly household bill
 
@@ -79,6 +98,10 @@ All checks are hard: a failure writes nothing, exits with code 1, and the dashbo
 | Household bill: each zone-month's `price_hours` equals the sum in `zone_daily` | `zone_daily` already matches Silver, so no hour is lost or counted twice in the bill either |
 | Household bill: every Norgespris bill equals kWh × 0.40 × (1 + VAT) | The hourly pricing and the VAT per zone add up |
 | Household bill: no month above 5,000 kWh | The support cap we leave out never applies |
+| Cheapest hours: as many priced hours in `consumer_prices_hourly` as in `zone_daily` since January 2024 | No hour is lost between Silver and the household prices |
+| Cheapest hours: VAT, strømstønad and the price after it follow the rules | strømstønad ≥ 0, never above the price with VAT |
+| Cheapest hours: three blocks for every complete zone-day, each exactly as long as it says | A day with all its hours always gets an answer |
+| Cheapest hours: no cheapest block dearer than the block starting at 17:00 | The ranking found the minimum |
 
 The tests recompute the figures from hand-made hourly data. For example, a price that falls exactly 5 øre per degree must give a slope of 5.0 and a correlation of −1. For the bill, the worked example in [use_cases.md](use_cases.md), section 9 (NO1, 2026, spot 1.00 NOK: 1.25 with no support, 0.99 with strømstønad, 0.50 with Norgespris) is a test, and so are NO4 without VAT and the 743- and 745-hour months.
 
@@ -99,11 +122,16 @@ The dashboard's sidebar reads them on every page:
 - **The last Gold run failed:** the newest run file is newer than `latest.json` and did not succeed;
 - **Sample data:** the tables came from `scripts/make_sample_gold.py`.
 
+**The afternoon day-ahead run** (`day_ahead.yml`, G10) fetches tomorrow's prices every 30 minutes from 11:07 to 15:37 UTC and rebuilds Silver and Gold when they arrive, normally a few minutes after 13:00 Norwegian time. A try before publication ends after five API calls and leaves no manifest. A try after Gold has tomorrow finds nothing new and skips Silver and Gold. `latest.json` records it in `day_ahead`: the delivery day and the zones whose day is complete. The cheapest-hours page shows "usually arrives around 13:00" before 14:30, and a warning after 14:30 while tomorrow is missing.
+
 The dashboard caches the tables and uses `built_at_utc` as part of the cache key. A new Gold run therefore shows up on the next page load, without restarting Streamlit.
 
 ## 6. The dashboard
 
 ```text
+api/
+├── main.py           # the cheapest hours API (FastAPI, open, no generated docs): thin HTTP wrappers
+└── gold.py           # reads the Gold tables (cached until a new Gold run) and builds every answer, incl. 503 + Retry-After
 dashboard/
 ├── app.py            # entry point: builds the menu from registry.py and the sidebar status
 ├── registry.py       # the use cases: question, user, deadline, planned tables, status, page module
@@ -112,10 +140,20 @@ dashboard/
 ├── charts.py         # Altair charts in one style: fixed zone colours, one y-axis, tooltips
 └── views/
     ├── overview.py        # home page: one card per use case
+    ├── cheapest_hours.py  # use case 1
+    ├── api_docs.py        # the API's documentation and try-it panel ("More" in the menu)
     ├── prices_weather.py  # use case 2
     ├── household_bill.py  # use case 3
     └── planned.py         # placeholder for use cases that aren't built yet
 ```
+
+**The use case 1 page:**
+- **Choices:** zone, day (tomorrow or today), scheme (strømstønad or Norgespris) and kWh to move (20, about a car charge).
+- **Before tomorrow is here:** "usually arrives around 13:00" before 14:30, a warning after; the page shows today meanwhile.
+- **The answer:** the cheapest 1-, 3- and 6-hour blocks, each with its average price and what moving the kWh there saves against starting at 17:00.
+- **Every hour of the day** as columns: the chosen block in blue, the three dearest other hours in red, the rest light grey. Blue and red pass the palette checks as a pair in both modes; the legend, the tooltip and a table name each hour's role.
+- **With Norgespris:** a note that every hour costs the same, and the flat day; no blocks.
+- **For apps and smart chargers:** a link to the **API for apps** page: the endpoints, a try-it panel (endpoint, zone, day, block length → the request, the status and the exact answer, built by the same functions as the API in `api/gold.py`), the status codes, the fields and a charger example in Python.
 
 **The use case 2 page:**
 - **What happened:**
@@ -151,5 +189,7 @@ dashboard/
 
 - ✅ The first run on the VM: Gold is built nightly in prod, and the dashboard runs through the tunnel.
 - ⏳ Use case 3 on the VM: the `gold` job on `dev`, then `main`.
-- ⏳ Use cases 1 and 4, and the Data health page ([use_cases.md](use_cases.md)).
+- ⏳ Use case 1 on the VM: merge to `dev`, start **Day-ahead Prices** by hand on `dev` after 13:00, then `main`. Record when tomorrow reached Gold on the first days, as evidence for the 14:30 deadline.
+- ⏳ The API on the VM: `pip install -r requirements-dashboard.txt` in `~/dashboard-env`, then the `dat535-api` service ([docs/api.md](../api.md), section 1).
+- ⏳ Use case 4 and the Data health page ([use_cases.md](use_cases.md)).
 - ⏳ A note in the report on how a correlation is not a cause: hydropower reserves, gas prices and exports move prices too.
