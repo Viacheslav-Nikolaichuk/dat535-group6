@@ -1,0 +1,207 @@
+name: Day-ahead Prices
+
+# Tomorrow's prices are published around 13:00 Norwegian time, and use case 1 (cheapest hours tomorrow)
+# promises them by 14:30. This workflow fetches them and rebuilds Silver and Gold:
+# prices -> bronze_chaos -> silver -> gold, the same layers as pipeline.yml, with prices only.
+#
+# A try before publication ends after five API calls (exit code 3, shown as success). Once tomorrow's
+# prices are in Bronze and Gold, later tries find nothing new and skip the other jobs.
+#
+# Environment follows the branch, as in pipeline.yml: main writes prod (the schedule only fires on
+# main), manual runs from dev write dev.
+
+on:
+  schedule:
+    # Every 30 minutes, off the hour: GitHub delays scheduled runs most at the start of each hour
+    # (pipeline.yml). The cron is UTC: 11:07-15:37 UTC is 12:07-16:37 Norwegian winter time and
+    # 13:07-17:37 in summer, so the first tries after publication come well before 14:30.
+    - cron: '7,37 11-15 * * *'
+  workflow_dispatch:
+
+# Shared with pipeline.yml: a day-ahead run and the nightly run never write the same environment at once.
+concurrency:
+  group: data-pipeline-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prices:
+    name: Day-ahead Prices
+    runs-on: self-hosted
+    timeout-minutes: 15
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+    env:
+      DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+    outputs:
+      rebuild: ${{ steps.gold.outputs.rebuild }}
+
+    steps:
+      # main writes prod, dev writes dev; any other branch is refused before touching data.
+      - name: Guard branch
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|dev) ;;
+            *) echo "::error::Data workflows only run from main (prod) or dev (dev), not '$GITHUB_REF_NAME'"; exit 1 ;;
+          esac
+          if [ "$DAT535_ENV" = "prod" ] && [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Only main may write to prod"; exit 1
+          fi
+          echo "Environment: $DAT535_ENV -> $DAT535_DATA_DIR/$DAT535_ENV"
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          source ~/spark-env/bin/activate
+          pip install -q -r requirements.txt
+
+      # Writes delivery_day, published and changed to $GITHUB_OUTPUT. Exit code 3 means "not published
+      # yet": a normal outcome before ~13:00, so the job succeeds and the next try picks it up.
+      - name: Fetch tomorrow's prices
+        id: ingest
+        run: |
+          source ~/spark-env/bin/activate
+          set +e
+          python src/ingestion/ingest_daily.py --day-ahead
+          rc=$?
+          set -e
+          if [ "$rc" -eq 3 ]; then
+            echo "Tomorrow's prices are not (all) published yet; a later try will fetch them."
+            exit 0
+          fi
+          exit "$rc"
+
+      # Rebuild when new files arrived, or when tomorrow is published but Gold doesn't have it yet
+      # (an earlier try fetched the prices, then Silver or Gold failed).
+      - name: Decide whether Silver and Gold need a rebuild
+        id: gold
+        env:
+          DELIVERY_DAY: ${{ steps.ingest.outputs.delivery_day }}
+          PUBLISHED: ${{ steps.ingest.outputs.published }}
+          CHANGED: ${{ steps.ingest.outputs.changed }}
+        run: |
+          source ~/spark-env/bin/activate
+          python - >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, os
+          from config.settings import GOLD_DIR
+          try:
+              status = json.loads((GOLD_DIR / "_status" / "latest.json").read_text(encoding="utf-8"))
+              through = status["freshness"]["prices_through"] or ""
+          except (OSError, ValueError, KeyError):
+              through = ""
+          behind = os.environ["PUBLISHED"] == "true" and through < os.environ["DELIVERY_DAY"]
+          print(f"rebuild={str(os.environ['CHANGED'] == 'true' or behind).lower()}")
+          EOF
+          cat "$GITHUB_OUTPUT"
+
+      - name: Write GitHub Step Summary
+        if: always()
+        env:
+          DELIVERY_DAY: ${{ steps.ingest.outputs.delivery_day }}
+          PUBLISHED: ${{ steps.ingest.outputs.published }}
+          CHANGED: ${{ steps.ingest.outputs.changed }}
+          REBUILD: ${{ steps.gold.outputs.rebuild }}
+        run: |
+          echo "## Day-ahead Prices" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${DAT535_ENV} (branch ${{ github.ref_name }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Delivery day (Norwegian) | ${DELIVERY_DAY:-–} |" >> $GITHUB_STEP_SUMMARY
+          echo "| All zones published | ${PUBLISHED:-–} |" >> $GITHUB_STEP_SUMMARY
+          echo "| New Bronze files | ${CHANGED:-–} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rebuild Silver and Gold | ${REBUILD:-–} |" >> $GITHUB_STEP_SUMMARY
+
+  bronze_chaos:
+    name: Bronze Chaos Copy
+    needs: prices
+    if: needs.prices.outputs.rebuild == 'true'
+    runs-on: self-hosted
+    timeout-minutes: 60
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+    env:
+      DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+
+    steps:
+      - name: Guard branch
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|dev) ;;
+            *) echo "::error::Data workflows only run from main (prod) or dev (dev), not '$GITHUB_REF_NAME'"; exit 1 ;;
+          esac
+          if [ "$DAT535_ENV" = "prod" ] && [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Only main may write to prod"; exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Inject errors into Bronze copy
+        run: |
+          set -euo pipefail
+          source ~/spark-env/bin/activate
+          # Only Bronze files not yet in bronze_chaos/ are processed: here, tomorrow's price files.
+          python src/ingestion/chaos_injector.py
+
+  silver:
+    name: Silver Layer
+    needs: bronze_chaos
+    runs-on: self-hosted
+    timeout-minutes: 60
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+    env:
+      DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+
+    steps:
+      - name: Guard branch
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|dev) ;;
+            *) echo "::error::Data workflows only run from main (prod) or dev (dev), not '$GITHUB_REF_NAME'"; exit 1 ;;
+          esac
+          if [ "$DAT535_ENV" = "prod" ] && [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Only main may write to prod"; exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Build Silver tables
+        run: |
+          set -euo pipefail
+          source ~/spark-env/bin/activate
+          # Exit code 1 = a hard check failed and nothing was written (the previous Silver stays).
+          python src/silver/run_silver.py
+
+  gold:
+    name: Gold Layer
+    needs: silver
+    runs-on: self-hosted
+    timeout-minutes: 30
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+    env:
+      DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+
+    steps:
+      - name: Guard branch
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|dev) ;;
+            *) echo "::error::Data workflows only run from main (prod) or dev (dev), not '$GITHUB_REF_NAME'"; exit 1 ;;
+          esac
+          if [ "$DAT535_ENV" = "prod" ] && [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Only main may write to prod"; exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Build Gold tables
+        run: |
+          set -euo pipefail
+          source ~/spark-env/bin/activate
+          # Exit code 1 = a hard check failed and nothing was written (the previous Gold stays).
+          python src/gold/run_gold.py

@@ -1,6 +1,6 @@
 # Gold use cases
 
-**Status:** use cases 2 (dashboard) and 3 (report) are built: Gold tables, checks, status file and a Streamlit page each ([gold_layer.md](gold_layer.md)). Use cases 1 and 4 are still proposals, with placeholder pages in the dashboard.
+**Status:** use cases 1 (application), 2 (dashboard) and 3 (report) are built: Gold tables, checks, status file and a Streamlit page each ([gold_layer.md](gold_layer.md)). Use case 1 also has the afternoon day-ahead price run. Use case 4 is still a proposal, with a placeholder page in the dashboard.
 
 **Data:** two sources only: electricity prices (hvakosterstrommen.no) and weather (MET Frost). Elhub is out of scope; that work is archived on the branch `feat/elhub-bronze`.
 
@@ -93,7 +93,7 @@ A smart charger or a home-automation system could read the same data as a small 
 
 **Why Gold.**
 - Silver has spot prices only. Gold adds VAT and the support schemes (section 9) and ranks the hours of each day.
-- Strømstønad doesn't change the order of the hours; it only flattens prices above the threshold.
+- Strømstønad doesn't change the order of single hours; it only flattens prices above the threshold. For a block of hours it can: the cheapest block on average after strømstønad can differ from the cheapest on spot, so Gold ranks blocks by the price after strømstønad ([gold_layer.md](gold_layer.md), G11).
 - With Norgespris every hour costs the same, so the page says that moving usage saves nothing on the energy price.
 
 **Gold output.**
@@ -103,7 +103,7 @@ A smart charger or a home-automation system could read the same data as a small 
   - strømstønad and the price after strømstønad;
   - the Norgespris price.
 - `cheapest_hours`, one row per zone, day and block length. It holds the start and end time, the average price, and the saving compared with starting at 17:00 (for example, for a 20 kWh car charge).
-- `cheapest_hours_tomorrow.json`: tomorrow only, for an app.
+- For apps and smart chargers, an HTTP API serves both tables as JSON, for today and tomorrow ([api.md](../api.md); it replaced the planned file `cheapest_hours_tomorrow.json`, [gold_layer.md](gold_layer.md), G13).
 
 **Freshness.**
 - Prices are published around 13:00. A day-ahead run at about 13:15 (retrying hourly) builds this by **14:30**, well before people plug in their cars in the evening.
@@ -256,7 +256,7 @@ The guide asks how consumers know Gold is ready, and what happens when upstream 
 
 ## 8. What we need before building Gold
 
-1. **A day-ahead price run** (use cases 1 and 4). It is already built on `feat/elhub-bronze`; we port only that part, without Elhub.
+1. **A day-ahead price run** (use cases 1 and 4). ✅ Built on `feat/gold-cheapest-hours`: `ingest_daily.py --day-ahead` and the workflow `day_ahead.yml` ([gold_layer.md](gold_layer.md), G10). The version on `feat/elhub-bronze` was never pushed, so it was written anew.
 2. **The Silver layer for prices and weather** (project definition, sections 4 and 7), with one change:
    - The definition joins prices and weather with an *inner* join. Tomorrow's prices have no weather yet, so they would be dropped.
    - Silver must keep every price hour (a left join from prices) and leave weather empty where it isn't known yet.

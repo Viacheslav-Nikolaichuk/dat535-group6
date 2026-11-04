@@ -5,7 +5,7 @@ Gold lives in <data root>/<env>/gold/ (config/settings.py, which follows DAT535_
 overrides it, e.g. to look at a scratch Gold folder.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import json
 import os
 from pathlib import Path
@@ -296,3 +296,83 @@ def household_kwh_per_year(bill: pd.DataFrame, zone: str) -> Optional[float]:
     rows = bill[(bill["bidding_zone"] == zone) & (bill["scheme"] == SCHEME_NONE) & bill["is_final"]]
     newest = rows.sort_values(["year", "month"]).tail(12)
     return float(newest["kwh"].sum()) if len(newest) == 12 else None
+
+
+# ---------------------------------------------------------------------- #
+# Figures for the cheapest hours page (use case 1)
+# ---------------------------------------------------------------------- #
+TOMORROW_PUBLISHED_AROUND = "13:00"
+TOMORROW_READY_BY = time(14, 30)  # Norwegian time (use_cases.md, section 3)
+CAR_CHARGE_KWH = 20.0
+
+# The price a household pays per kWh under the schemes the page offers (consumer_prices_hourly columns).
+# Every household without Norgespris gets strømstønad, so "no support" is not a choice for tomorrow.
+HOUSEHOLD_PRICE = {SCHEME_STROMSTOTTE: "price_with_stromstotte_nok_kwh", SCHEME_NORGESPRIS: "norgespris_nok_kwh"}
+
+ROLE_CHEAPEST = "Cheapest block"
+ROLE_EXPENSIVE = "Most expensive hours"
+ROLE_OTHER = "Other hours"
+
+
+def oslo_today(now_utc: datetime) -> date:
+    return now_utc.astimezone(OSLO).date()
+
+
+def tomorrow_is_late(now_utc: datetime) -> bool:
+    """Past the 14:30 deadline (Norwegian time) for tomorrow's prices."""
+    return now_utc.astimezone(OSLO).time() >= TOMORROW_READY_BY
+
+
+def _utc(values: pd.Series) -> pd.Series:
+    """Timestamps as UTC, whether the Parquet reader returned them with or without a time zone."""
+    values = pd.to_datetime(values)
+    return values.dt.tz_localize("UTC") if values.dt.tz is None else values.dt.tz_convert("UTC")
+
+
+def published_zones(cheapest: pd.DataFrame, day: date) -> List[str]:
+    """Zones whose day is complete in Gold (they have cheapest blocks for it), in zone order."""
+    zones = set(cheapest.loc[cheapest["local_date"].dt.date == day, "bidding_zone"])
+    return [z for z in PRICE_ZONES if z in zones]
+
+
+def blocks_for(cheapest: pd.DataFrame, zone: str, day: date) -> pd.DataFrame:
+    """The zone's cheapest 1-, 3- and 6-hour blocks on the day, shortest first."""
+    rows = cheapest[(cheapest["bidding_zone"] == zone) & (cheapest["local_date"].dt.date == day)]
+    return rows.sort_values("block_hours", ignore_index=True)
+
+
+def day_prices(consumer: pd.DataFrame, zone: str, day: date, scheme: str) -> pd.DataFrame:
+    """The zone's hours on the day, in order, with what a household pays under `scheme` (øre/kWh).
+
+    Columns: utc_hour, time ("HH:00"; the repeated 02:00 on the autumn daylight saving day becomes
+    "02:00 (2nd)", so every hour keeps its own bar), price_ore, spot_ore, with_vat_ore.
+    """
+    rows = consumer[(consumer["bidding_zone"] == zone) & (consumer["local_date"].dt.date == day)]
+    rows = rows.assign(utc_hour=_utc(rows["utc_hour"])).sort_values("utc_hour", ignore_index=True)
+    price = rows[HOUSEHOLD_PRICE[scheme]]
+    if scheme == SCHEME_STROMSTOTTE:  # a year without a known threshold has VAT only
+        price = price.fillna(rows["price_with_vat_nok_kwh"])
+    times = [f"{h:02d}:00" for h in rows["local_hour"]]
+    times = [t if t not in times[:i] else f"{t} (2nd)" for i, t in enumerate(times)]
+    return pd.DataFrame({
+        "utc_hour": rows["utc_hour"],
+        "time": times,
+        "price_ore": price * 100,
+        "spot_ore": rows["spot_nok_kwh"] * 100,
+        "with_vat_ore": rows["price_with_vat_nok_kwh"] * 100,
+    })
+
+
+def hour_roles(prices: pd.DataFrame, block: Optional[pd.Series], expensive: int = 3) -> pd.Series:
+    """For the chart: the hours of the cheapest block, the `expensive` dearest other hours, the rest.
+
+    With a flat price (Norgespris) no hour is dearer than another, so none is marked expensive.
+    """
+    roles = pd.Series(ROLE_OTHER, index=prices.index)
+    if block is not None:
+        start, end = _utc(pd.Series([block["start_utc"], block["end_utc"]]))
+        roles[(prices["utc_hour"] >= start) & (prices["utc_hour"] < end)] = ROLE_CHEAPEST
+    if prices["price_ore"].nunique() > 1:
+        others = prices.loc[roles == ROLE_OTHER, "price_ore"]
+        roles[others.nlargest(expensive).index] = ROLE_EXPENSIVE
+    return roles

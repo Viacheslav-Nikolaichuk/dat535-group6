@@ -17,6 +17,9 @@ Both schemes cover at most 5,000 kWh a month; the household stays below that (a 
 cap is left out.
 """
 
+from datetime import date
+from typing import Optional
+
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 
@@ -42,12 +45,25 @@ def vat_rate() -> Column:
     return F.when(F.col("bidding_zone").isin(*NO_VAT_ZONES), 0.0).otherwise(VAT)
 
 
-def build_household_bill_monthly(zone_hourly: DataFrame, dim_date: DataFrame) -> DataFrame:
+def bill_days(local_date: Column, bill_until: Optional[date]) -> Column:
+    """The days the bill covers: from BILL_START, and before bill_until when it is given."""
+    days = local_date >= BILL_START
+    return days if bill_until is None else days & (local_date < F.lit(bill_until))
+
+
+def build_household_bill_monthly(
+    zone_hourly: DataFrame, dim_date: DataFrame, bill_until: Optional[date] = None
+) -> DataFrame:
     """One row per zone, Norwegian month and scheme, from BILL_START.
 
     support_nok is what the scheme saved compared with paying the spot price with VAT. For Norgespris
     it is negative when the spot price was below the Norgespris price: the household then paid more.
     A scheme that didn't exist in a month (Norgespris before October 2025) has no row for it.
+
+    bill_until (exclusive) is the day Gold runs. Silver also has today's and, after the day-ahead run,
+    tomorrow's prices, but no weather for them yet: billing them would use estimated heating and make
+    a month final before it is over. With the cap, month to date runs through yesterday, and a month
+    becomes final with the nightly run on the 1st.
     """
     keys = ["bidding_zone", "year", "month"]
     spot = F.col("price_nok_kwh")
@@ -63,7 +79,7 @@ def build_household_bill_monthly(zone_hourly: DataFrame, dim_date: DataFrame) ->
     support = F.when(threshold.isNotNull(), STROMSTOTTE_SHARE * F.greatest(spot - threshold, F.lit(0.0)) * with_vat)
     norgespris = F.when(F.col("local_date").between(NORGESPRIS_FROM, NORGESPRIS_TO), NORGESPRIS_NOK * with_vat)
 
-    hourly = zone_hourly.filter(F.col("local_date") >= BILL_START).select(
+    hourly = zone_hourly.filter(bill_days(F.col("local_date"), bill_until)).select(
         *keys,
         "has_price",
         kwh.alias("kwh"),
