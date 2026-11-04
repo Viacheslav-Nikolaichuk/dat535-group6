@@ -47,7 +47,7 @@ shared = [uc for uc in registry.USE_CASES if not uc.number]
 sections = {
     "": [home],
     "Use cases": [ui.PAGES[uc.key] for uc in use_cases],
-    "Shared": [ui.PAGES[uc.key] for uc in shared],
+    "More": [ui.PAGES[uc.key] for uc in shared],
 }
 navigation = st.navigation({name: pages for name, pages in sections.items() if pages})
 ui.sidebar_status()

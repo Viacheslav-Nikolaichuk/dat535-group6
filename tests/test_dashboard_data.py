@@ -191,3 +191,90 @@ def test_sample_generator_refuses_to_overwrite_real_gold(tmp_path):
     result = subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "make_sample_gold.py"),
                              "--output-dir", str(out)], capture_output=True, text=True, env=DEV_ENV)
     assert result.returncode == 2 and "overwrite real Gold" in result.stdout
+
+
+# ---------------------------------------------------------------------- #
+# Use case 1: cheapest hours
+# ---------------------------------------------------------------------- #
+@pytest.mark.parametrize("now, late", [
+    (datetime(2026, 11, 3, 13, 29, tzinfo=timezone.utc), False),  # 14:29 in Oslo
+    (datetime(2026, 11, 3, 13, 30, tzinfo=timezone.utc), True),
+    (datetime(2026, 7, 1, 12, 30, tzinfo=timezone.utc), True),  # 14:30 in Oslo, summer time
+])
+def test_tomorrow_is_late_after_half_past_two(now, late):
+    assert data.tomorrow_is_late(now) is late
+
+
+def test_today_follows_the_norwegian_clock():
+    assert data.oslo_today(datetime(2026, 11, 3, 23, 30, tzinfo=timezone.utc)) == date(2026, 11, 4)
+
+
+def _consumer(rows):
+    """consumer_prices_hourly rows: (zone, local_date, local_hour, utc_hour, spot, with_vat, with_stromstotte, norgespris)."""
+    df = pd.DataFrame(rows, columns=["bidding_zone", "local_date", "local_hour", "utc_hour", "spot_nok_kwh",
+                                     "price_with_vat_nok_kwh", "price_with_stromstotte_nok_kwh", "norgespris_nok_kwh"])
+    return df.assign(local_date=pd.to_datetime(df["local_date"]), utc_hour=pd.to_datetime(df["utc_hour"]))
+
+
+def test_day_prices_per_scheme_and_the_repeated_hour():
+    consumer = _consumer([
+        ("NO1", "2026-10-25", 1, "2026-10-24 23:00", 1.0, 1.25, 0.99, 0.5),
+        ("NO1", "2026-10-25", 2, "2026-10-25 00:00", 2.0, 2.5, 1.1, 0.5),
+        ("NO1", "2026-10-25", 2, "2026-10-25 01:00", 0.4, 0.5, None, 0.5),  # second 02:00; no strømstønad value
+        ("NO2", "2026-10-25", 1, "2026-10-24 23:00", 9.0, 9.0, 9.0, 0.5),
+    ])
+
+    prices = data.day_prices(consumer, "NO1", date(2026, 10, 25), data.SCHEME_STROMSTOTTE)
+    assert prices["time"].tolist() == ["01:00", "02:00", "02:00 (2nd)"]
+    assert prices["price_ore"].round(6).tolist() == [99.0, 110.0, 50.0]  # with VAT where strømstønad is empty
+    assert prices["spot_ore"].tolist() == [100.0, 200.0, 40.0]
+    norgespris = data.day_prices(consumer, "NO1", date(2026, 10, 25), data.SCHEME_NORGESPRIS)
+    assert norgespris["price_ore"].tolist() == [50.0, 50.0, 50.0]
+
+
+def test_hour_roles_mark_the_block_and_the_dearest_other_hours():
+    prices = pd.DataFrame({
+        "utc_hour": pd.date_range("2026-11-04 00:00", periods=6, freq="h", tz="UTC"),
+        "price_ore": [50.0, 10.0, 12.0, 90.0, 80.0, 70.0],
+    })
+    block = pd.Series({"start_utc": pd.Timestamp("2026-11-04 01:00"), "end_utc": pd.Timestamp("2026-11-04 03:00")})
+
+    roles = data.hour_roles(prices, block)
+    assert roles.tolist() == [data.ROLE_OTHER, data.ROLE_CHEAPEST, data.ROLE_CHEAPEST,
+                              data.ROLE_EXPENSIVE, data.ROLE_EXPENSIVE, data.ROLE_EXPENSIVE]
+    flat = data.hour_roles(prices.assign(price_ore=50.0), None)  # Norgespris: no hour is dearer
+    assert set(flat) == {data.ROLE_OTHER}
+
+
+def test_published_zones_and_blocks_for_a_day():
+    cheapest = pd.DataFrame({
+        "bidding_zone": ["NO2", "NO1", "NO1", "NO1"],
+        "local_date": pd.to_datetime(["2026-11-04", "2026-11-04", "2026-11-04", "2026-11-03"]),
+        "block_hours": [1, 6, 1, 1],
+    })
+    assert data.published_zones(cheapest, date(2026, 11, 4)) == ["NO1", "NO2"]
+    assert data.blocks_for(cheapest, "NO1", date(2026, 11, 4))["block_hours"].tolist() == [1, 6]
+    assert data.published_zones(cheapest, date(2026, 11, 5)) == []
+
+
+@pytest.mark.parametrize("without_tomorrow", [False, True])
+def test_sample_gold_has_the_cheapest_hours(tmp_path, without_tomorrow):
+    out = tmp_path / "gold"
+    args = ["--output-dir", str(out)] + (["--without-tomorrow"] if without_tomorrow else [])
+    subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "make_sample_gold.py"), *args],
+                   check=True, capture_output=True, env=DEV_ENV)
+
+    status = data.read_status(out)
+    consumer = data.read_table(out / "consumer_prices_hourly")
+    cheapest = data.read_table(out / "cheapest_hours")
+    assert len(consumer) == status["tables"]["consumer_prices_hourly"]["rows"]
+    assert consumer["local_date"].min() == pd.Timestamp("2024-01-01")
+    assert set(cheapest["block_hours"]) == {1, 3, 6} and (cheapest["saving_nok_kwh"] >= 0).all()
+
+    tomorrow = date.fromisoformat(status["day_ahead"]["delivery_day"])
+    expected = [] if without_tomorrow else ["NO1", "NO2", "NO3", "NO4", "NO5"]
+    assert status["day_ahead"]["published_zones"] == expected
+    assert data.published_zones(cheapest, tomorrow) == expected
+    # Weather stops at yesterday, as in real Gold: tomorrow's prices never make a day complete.
+    daily = data.read_table(out / "zone_daily")
+    assert not daily.loc[daily["local_date"].dt.date >= tomorrow - pd.Timedelta(days=1), "is_complete"].any()
