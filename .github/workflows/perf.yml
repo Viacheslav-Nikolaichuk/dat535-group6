@@ -1,0 +1,79 @@
+name: Silver Performance
+
+# Manual-only Silver performance experiments (scripts/perf_silver.py, docs/plans/silver_layer.md section 10).
+# Start one batch at a time, with `setup` first.
+#
+# Everything stays under <data root>/perf/. Only `setup` touches prod, and it only reads prod/bronze_chaos.
+# The VM has one runner, which handles one job at a time: a batch can't overlap a pipeline run, and a
+# scheduled run that comes due during a batch waits until the batch has finished.
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: 'Batch to run (start with setup)'
+        required: true
+        type: choice
+        default: setup
+        options:
+          - setup
+          - cores
+          - cache
+          - shuffle
+          - broadcast
+          - size
+          - read
+      repeats:
+        description: 'Measured runs per variant'
+        required: false
+        default: '3'
+
+concurrency:
+  group: silver-performance
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    name: Silver Performance
+    runs-on: self-hosted
+    timeout-minutes: 240
+    environment: dev
+    env:
+      DAT535_ENV: dev
+      DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+      PYSPARK_PYTHON: /home/ubuntu/spark-env/bin/python
+      # Inputs are passed via env (not inlined into the script) to prevent shell injection.
+      IN_BATCH: ${{ github.event.inputs.batch }}
+      IN_REPEATS: ${{ github.event.inputs.repeats || '3' }}
+
+    steps:
+      - name: Guard branch
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|dev) ;;
+            *) echo "::error::Data workflows only run from main or dev, not '$GITHUB_REF_NAME'"; exit 1 ;;
+          esac
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          source ~/spark-env/bin/activate
+          pip install -q -r requirements.txt
+
+      - name: Run the batch
+        run: |
+          set -euo pipefail
+          source ~/spark-env/bin/activate
+          [[ "$IN_REPEATS" =~ ^[1-9][0-9]?$ ]] || { echo "Invalid repeats"; exit 2; }
+          python scripts/perf_silver.py "$IN_BATCH" --repeats "$IN_REPEATS"
+
+      # The results so far: the newest run's artifact holds every batch.
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: silver-performance-${{ github.event.inputs.batch }}-${{ github.run_number }}
+          path: /home/ubuntu/spark-project-data/perf/results
+          if-no-files-found: warn
