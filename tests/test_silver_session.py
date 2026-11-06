@@ -12,6 +12,10 @@ def test_session_runs_in_utc_with_dynamic_partition_overwrite(spark):
     assert spark.conf.get("spark.sql.sources.partitionOverwriteMode") == "dynamic"
 
 
+def test_executors_get_more_than_sparks_default_memory(spark):
+    assert spark.sparkContext.getConf().get("spark.executor.memory") == "3g"
+
+
 def test_spark_version_matches_the_vm(spark):
     # requirements.txt pins pyspark to the VM's Spark; an accidental upgrade fails here first.
     assert spark.version == "3.5.0"
