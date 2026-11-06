@@ -279,7 +279,7 @@ The guide asks for tuning "supported by relevant evidence rather than optimizati
 | File | What it does |
 |---|---|
 | `run_silver.py` | Command line: `--input`, `--output-dir`, `--allow-synthetic` (later `--months`). Exit codes 0, 1 and 2, as in `ingest_daily.py`. |
-| `spark_session.py` | One place for the Spark settings: local mode, UTC, adaptive execution, dynamic partition overwrite, 8 shuffle partitions |
+| `spark_session.py` | One place for the Spark settings: master from `SPARK_MASTER` (the workflows use the cluster, anything else stays in local mode), UTC, adaptive execution, dynamic partition overwrite, 8 shuffle partitions |
 | `bronze_reader.py` | Schemas, reading, truncated and synthetic files, lineage, version choice |
 | `prices.py`, `weather.py`, `zone_hourly.py` | One file per table |
 | `reference.py` | `dim_date` and `dim_station` |

@@ -8,7 +8,7 @@ name: Day-ahead Prices
 # prices are in Bronze and Gold, later tries find nothing new and skip the other jobs.
 #
 # Environment follows the branch, as in pipeline.yml: main writes prod (the schedule only fires on
-# main), manual runs from dev write dev.
+# main), manual runs from dev write dev. Silver and Gold run on the Spark cluster, as in pipeline.yml.
 
 on:
   schedule:
@@ -153,6 +153,8 @@ jobs:
     env:
       DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
       DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+      SPARK_MASTER: spark://spark:7077
+      PYSPARK_PYTHON: /home/ubuntu/spark-env/bin/python
 
     steps:
       - name: Guard branch
@@ -184,6 +186,8 @@ jobs:
     env:
       DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
       DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+      SPARK_MASTER: spark://spark:7077
+      PYSPARK_PYTHON: /home/ubuntu/spark-env/bin/python
 
     steps:
       - name: Guard branch

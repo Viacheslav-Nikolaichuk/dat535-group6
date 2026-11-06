@@ -6,6 +6,9 @@ name: Data Pipeline
 #
 # Environment follows the branch: runs from main write to <data root>/prod (the cron
 # schedule only fires on main), manual runs from dev write to <data root>/dev.
+#
+# Silver and Gold run on the Spark cluster: SPARK_MASTER picks the cluster, and PYSPARK_PYTHON gives
+# the workers the same Python as this runner (their system python3 is a different version).
 
 on:
   schedule:
@@ -177,6 +180,8 @@ jobs:
     env:
       DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
       DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+      SPARK_MASTER: spark://spark:7077
+      PYSPARK_PYTHON: /home/ubuntu/spark-env/bin/python
 
     steps:
       # main writes prod, dev writes dev; any other branch is refused before touching data.
@@ -212,6 +217,8 @@ jobs:
     env:
       DAT535_ENV: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
       DAT535_DATA_DIR: /home/ubuntu/spark-project-data
+      SPARK_MASTER: spark://spark:7077
+      PYSPARK_PYTHON: /home/ubuntu/spark-env/bin/python
 
     steps:
       # main writes prod, dev writes dev; any other branch is refused before touching data.
