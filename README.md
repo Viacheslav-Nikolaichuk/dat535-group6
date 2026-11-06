@@ -13,7 +13,8 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │       ├── ci.yml                         # All unit tests incl. Spark on GitHub-hosted runners (push to dev, PRs to dev/main)
 │       ├── pipeline.yml                   # Bronze -> chaos copy -> Silver -> Gold on the VM runner (cron 02:17 UTC on main = prod; manual on dev = dev)
 │       ├── day_ahead.yml                  # Tomorrow's prices -> chaos copy -> Silver -> Gold, every 30 min in the afternoon (main = prod)
-│       └── backfill.yml                   # Manual historical Bronze backfill on the VM runner (main = prod, dev = dev)
+│       ├── backfill.yml                   # Manual historical Bronze backfill on the VM runner (main = prod, dev = dev)
+│       └── perf.yml                       # Manual Silver performance experiments on the VM runner, one batch at a time
 ├── config/
 │   ├── settings.py                        # dev/prod environment, data paths, env loader, and API base settings
 │   ├── price_rules.py                     # VAT, strømstønad, Norgespris and the modelled household (use case 3)
@@ -29,7 +30,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   │   └── chaos_injector.py              # Builds bronze_chaos/: a Bronze copy with ~1% injected errors
 │   ├── silver/
 │   │   ├── run_silver.py                  # Silver entrypoint CLI: rebuilds every Silver table, checks before writing
-│   │   ├── spark_session.py               # SparkSession factory (UTC, dynamic partition overwrite, AQE)
+│   │   ├── spark_session.py               # SparkSession factory (master from SPARK_MASTER, UTC, dynamic partition overwrite, AQE)
 │   │   ├── bronze_reader.py               # Explicit Bronze schemas, truncated files, lineage, version choice
 │   │   ├── prices.py                      # Bronze prices -> silver/prices (repairs from EUR x EXR, DST-safe UTC)
 │   │   ├── weather.py                     # Bronze weather -> silver/weather_hourly (series choice, gap filling)
@@ -57,7 +58,8 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   └── dat535-api.service                 # systemd unit that keeps the cheapest hours API running on the VM
 ├── scripts/
 │   ├── test_api_connections.py            # Diagnostic smoke-test for API connectivity & credentials
-│   └── make_sample_gold.py                # Synthetic Gold tables for trying the dashboard without the VM
+│   ├── make_sample_gold.py                # Synthetic Gold tables for trying the dashboard without the VM
+│   └── perf_silver.py                     # Silver performance experiments on a frozen copy of the data
 ├── tests/
 │   ├── test_ingestion.py                  # PyTest suite for hashing, envelopes, versioning, CLI dates, and clients
 │   └── test_backfill.py                   # PyTest suite for the historical backfill (monthly runs, resume, date guard)
@@ -68,6 +70,7 @@ An automated, end-to-end Data Lakehouse architecture using **PySpark**, **Delta 
 │   └── test_silver_*.py                   # Spark tests (marker `spark`): reader, prices, weather, zone_hourly, end-to-end runs
 │   └── test_gold_*.py                     # Spark tests: use case 1, 2 and 3 tables, Bronze -> Silver -> Gold end-to-end
 │   └── test_dashboard_data.py             # Dashboard helpers and the sample generator (pandas, no Spark)
+│   └── test_perf_silver.py                # Performance experiments: event log, verdicts, frozen input, one real run
 ├── labs/                                  # Archived course laboratory materials (Lab 1, 2, 3)
 │   ├── lab1_1_setup_guide.md
 │   ├── lab1_install-spark.sh
@@ -198,6 +201,18 @@ Development and production are separated by the `DAT535_ENV` variable (`dev` or 
 
 ---
 
+## Spark Cluster
+
+The workflows run Silver and Gold on a Spark standalone cluster: master `spark://spark:7077` and three workers (the `spark` VM, `spark-worker-1` and `spark-worker-2`, with 4 cores and 6.8 GiB each).
+
+* **Shared data**: the `spark` VM shares `/home/ubuntu/spark-project-data` over NFS, and the other workers mount it at the same path, so every executor reads and writes the same files.
+* **Workflow settings**: the `silver` and `gold` jobs set `SPARK_MASTER` and `PYSPARK_PYTHON`. `PYSPARK_PYTHON` is needed because the workers' system `python3` is a different version from the runner's. Ingestion, the chaos copy and the dashboard don't use Spark.
+* **Memory**: `SPARK_EXECUTOR_MEMORY`, default `3g` per executor (cluster only).
+* **Runs by hand and tests** stay on one machine (`local[*]`) unless `SPARK_MASTER` is set. A cluster run must write under the shared folder, because `/tmp` is separate on each machine.
+* **If the cluster is down**: the job fails if the master can't be reached, and waits until the workflow's timeout if no worker is alive. Either way nothing is written, so the previous Silver and Gold stay in place.
+
+---
+
 ## Daily Ingestion Pipeline
 
 ### Running Manually
@@ -292,7 +307,27 @@ python src/silver/run_silver.py --input bronze --output-dir /tmp/silver_clean
 * **Cleaning**: price timestamps are parsed with their UTC offset (DST-safe) and a damaged NOK price is rebuilt as EUR × EXR; weather values that are null, impossible or flagged 5–7 by Frost are rejected, one series per element is used (2 m temperature, 10 m wind), and gaps of 1–2 hours are filled and flagged.
 * **Checks before writing**: no duplicate or empty keys, whole hours, values within bounds, a complete zone × hour grid, non-empty `prices` and `weather_hourly`, and at most half of a source's records rejected. A failed hard check writes nothing and exits with code 1, so Gold keeps the previous Silver. Tables are written to `silver/_staging/` and swapped into place only after every write succeeded, so a crash while writing also leaves the previous Silver intact. Soft checks (incomplete days, weather completeness, rejected share) only warn.
 * **Chaos score**: on the chaos copy, every error listed in `bronze_chaos/_manifests` is matched against `dq_issues`. The share found per error type and the issues not on the chaos list go to the run manifest, `dq_metrics` and the step summary.
-* **Settings**: `SILVER_INPUT` (`bronze_chaos` or `bronze`), `SPARK_DRIVER_MEMORY` (default `2g`), `SPARK_SHUFFLE_PARTITIONS` (default 8).
+* **Settings**: `SILVER_INPUT` (`bronze_chaos` or `bronze`), `SPARK_MASTER` (default `local[*]`; see [Spark Cluster](#spark-cluster)), `SPARK_DRIVER_MEMORY` (default `2g`), `SPARK_EXECUTOR_MEMORY` (default `3g`), `SPARK_SHUFFLE_PARTITIONS` (default 8).
+
+---
+
+## Silver Performance Experiments
+
+`scripts/perf_silver.py` measures Silver's performance decisions on a frozen copy of the data, without changing Silver's code. The design is in [docs/plans/silver_layer.md](docs/plans/silver_layer.md), section 10. It runs on the VM through a manual workflow: **Actions** -> **Silver Performance** -> **Run workflow**, on branch `dev`, one batch at a time, starting with `setup`.
+
+| Batch | What it does |
+|---|---|
+| `setup` | Copies `prod/bronze_chaos` once to `perf/input/`, and links a 1-year and a 1-month subset |
+| `cores` | The cluster against one VM with all cores, 2 cores and 1 core |
+| `cache` | All caches on, only the Bronze file cache on, all off |
+| `shuffle` | 8 or 200 shuffle partitions, each with adaptive execution on and off |
+| `broadcast` | Hints on, hints off with Spark choosing, broadcast off |
+| `size` | 5 years, 1 year and 1 month of input |
+| `read` | Read-only tests: month partitions, schema, small files |
+
+* **Results**: every run's **Artifacts** hold `summary.md` (also on the run's summary page), `runs.csv`, `read_runs.csv`, the query plans and the per-stage figures. The newest artifact holds every batch so far, and rerunning a batch replaces it in the summary.
+* **Data**: everything stays under `<data root>/perf/`, and each run's output is deleted afterwards. Only `setup` touches prod, and it only reads. `perf/eventlogs/` keeps one Spark event log per batch for the History Server. Delete `perf/input/` to freeze newer data, and the whole `perf/` folder when the experiments are finished.
+* **The runner**: the VM has one runner, so a batch can't overlap a pipeline run, and a scheduled run that comes due waits until the batch has finished. A variant is stopped after 20 minutes and not repeated.
 
 ---
 
