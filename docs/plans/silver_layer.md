@@ -262,25 +262,22 @@ The chaos injector writes down every error it makes. We match Silver's issue log
 
 The guide asks for tuning "supported by relevant evidence rather than optimization by assumption". `scripts/perf_silver.py` runs these experiments on a frozen copy of prod's `bronze_chaos`, without changing Silver's code. The **Silver Performance** workflow runs it on the VM, one batch at a time (README, Silver Performance Experiments).
 
-| Batch | Compares | What we expect to see |
+**First result (6 Nov 2026, the earlier `cores` batch on today's data):** the cluster was not faster than one VM (median 61 s against 58 s). About 20 s of each run is fixed cost outside Spark's tasks, and reading the ~20,000 small JSON files takes about half of each run. So the experiments now ask how the time grows with the data, and test only settings that we would change.
+
+**Bigger inputs:** `setup` builds ×5 and ×10 by copying every zone and station folder under new names (`zone=NO1_r1`, `station=SN18700_r1`, ...). Silver takes the zone or station from the folder name, so the files are unchanged and every cleaning rule still applies. The measuring process tells Silver about the extra zones and stations, and the copies take real disk and memory.
+
+| Batch | Compares | Decision it drives |
 |---|---|---|
-| `cores` | The cluster; one VM with all cores, 2 cores and 1 core | A small gain from the cluster: the data is small, and reading over NFS costs time. Gap filling partitions by station, so it can't use more than 6 tasks. |
-| `cache` | All caches on; only the Bronze file cache on; all off | Much slower without caches: parsing JSON is expensive, and many later steps reuse the result. All off may fail, because Spark refuses queries that need only `_corrupt_record` from raw files. |
-| `shuffle` | 8 or 200 shuffle partitions, each with adaptive execution on and off | 200 costs little with adaptive execution on, because it merges tiny partitions. |
-| `broadcast` | Hints on; hints off with Spark choosing; broadcast off | `BroadcastHashJoin` with the hints, and possibly without them too. With broadcast off, `SortMergeJoin` and more data shuffled. |
-| `size` | 5 years, 1 year and 1 month of input | Time grows slowly, because most of a run is fixed cost (section 15). |
-| `read` | Month partitions vs. one file, reading one month and the whole table | One month reads far fewer files (`PartitionFilters` in the plan). Gold reads the whole table, so the pipeline itself gains nothing. |
-| `read` | Fixed schema vs. letting Spark guess | Guessing reads all files an extra time. |
-| `read` | Default read tasks vs. fewer (`spark.sql.files.openCostInBytes`); JSON vs. compacted Parquet | Parsing many small JSON files costs far more than reading Parquet. |
+| `scale` | One VM (4 GB) against the cluster, at ×1, ×5 and ×10 | The fixed cost and the cost per GB of each setup; the size where the cluster starts to win; whether a full rebuild (D3) stays acceptable as the data grows |
 
 **Method:**
 - **Runs:** one warm-up run that is thrown away, then each variant three times in turn, each in a new process, so a noisy period doesn't hit only one of them.
-- **Judging:** we report the median and the range. A difference counts only if the two ranges don't overlap. A run counts only if it ends with `SUCCESS` and gives the same output as the batch's first variant: row counts, issue counts, and the sums of prices and temperatures.
+- **Judging:** we report the median and the range. Each variant is compared with the batch's first variant on the same input, and a difference counts only if the two ranges don't overlap. A run counts only if it ends with `SUCCESS` and gives the same output as that reference: row counts, issue counts, and the sums of prices and temperatures. A bigger input's reference must have N times the rows of ×1.
 - **What is recorded:**
   - time per phase, from timers around Silver's steps;
   - tasks, data shuffled, data spilled to disk and skew (slowest task against the median), from Spark's event log;
   - join types and shuffles, from the final plan of the query that writes `zone_hourly`, which reaches every earlier step through the cached tables.
-- **Limits to state in the report:** the data is small, the VMs may share hardware with other OpenStack users, three repeats won't catch small differences, and repeat runs read from the disk cache.
+- **Limits to state in the report:** the bigger inputs add zones and stations, not years of history; the VMs may share hardware with other OpenStack users; three repeats won't catch small differences; and repeat runs read partly from the disk cache.
 
 **Results:** `results/summary.md` and `results/runs.csv` in the workflow's artifacts. Each setting then gets a verdict: keep, change or remove.
 

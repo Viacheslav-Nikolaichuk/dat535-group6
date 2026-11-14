@@ -1,10 +1,12 @@
 """
-Tests for the Silver performance experiments (scripts/perf_silver.py): what the numbers are read from,
-how results are judged, and that switching a setting leaves Silver's output the same.
+Tests for the Silver performance experiments (scripts/perf_silver.py): the bigger inputs, what the numbers
+are read from, how results are judged, and that a bigger input gives Silver N times the rows.
 """
 
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +18,9 @@ from src.ingestion.chaos_injector import run_chaos_injection
 STATIONS = ["SN18700", "SN39040", "SN44560", "SN50540", "SN68860", "SN90450"]
 
 
+# ---------------------------------------------------------------------- #
+# Reading Spark's event log
+# ---------------------------------------------------------------------- #
 def _task_end(stage: int, run_ms: int, host: str = "worker-1", read: int = 0, remote: int = 0, spilled: int = 0,
               failed: bool = False) -> dict:
     return {
@@ -122,6 +127,22 @@ def test_a_log_without_that_query_has_no_plan(tmp_path):
     assert parsed["plan"] == "" and set(parsed["plan_counts"].values()) == {0}
 
 
+# ---------------------------------------------------------------------- #
+# Batches, schedule and verdicts
+# ---------------------------------------------------------------------- #
+def test_the_scale_batch_compares_one_vm_with_the_cluster_on_each_input():
+    variants = perf.batch_variants("scale")
+
+    assert [(v.name, v.input) for v in variants] == [
+        ("cluster_x1", "x1"), ("one_vm_x1", "x1"),
+        ("cluster_x5", "x5"), ("one_vm_x5", "x5"),
+        ("cluster_x10", "x10"), ("one_vm_x10", "x10"),
+    ]
+    cluster, one_vm = variants[0], variants[1]
+    assert cluster.master == perf.CLUSTER and cluster.driver_memory is None  # the project's own settings
+    assert one_vm.master == "local[*]" and one_vm.driver_memory == perf.SINGLE_VM_DRIVER_MEMORY
+
+
 def test_schedule_warms_up_once_then_takes_turns():
     assert list(perf.schedule(["A", "B"], 2)) == [("A", 0), ("A", 1), ("B", 1), ("A", 2), ("B", 2)]
 
@@ -137,49 +158,68 @@ def test_a_difference_counts_only_when_the_ranges_dont_overlap(values, verdict):
     assert perf.compare([10, 11, 12], values) == verdict
 
 
-def test_every_batch_starts_with_the_settings_the_workflows_use():
-    for batch, variants in perf.FULL_BATCHES.items():
-        reference = variants[0]
-        assert (reference.master, reference.input, reference.shuffle_partitions) == (perf.CLUSTER, "full", 8), batch
-        assert reference.adaptive and reference.cache == "on" and reference.broadcast == "hint", batch
-        assert len({v.name for v in variants}) == len(variants), batch
+# ---------------------------------------------------------------------- #
+# Setup: the frozen input and the bigger ones
+# ---------------------------------------------------------------------- #
+ORIGINAL = "electricity/zone=NO1/year=2025/month=01/2025_01_01.json"
+COPY_3 = "electricity/zone=NO1_r3/year=2025/month=01/2025_01_01.json"
 
 
 def _write_source(root: Path) -> None:
-    for relative in [
-        "electricity/zone=NO1/year=2024/month=12/2024_12_31.json",
-        "electricity/zone=NO1/year=2025/month=01/2025_01_01.json",
-        "weather/station=SN18700/year=2025/month=06/2025_06_01.json",
-        "_manifests/run__1.json",
-        "electricity/zone=NO1/year=2025/month=01/.2025_01_02.json.tmp",
-    ]:
+    files = {
+        ORIGINAL: '{"payload": [1]}',
+        "electricity/zone=NO1/year=2025/month=01/2025_01_02.json": "{}",
+        "weather/station=SN18700/year=2025/month=01/2025_01_01.json": "{}",
+        "_manifests/run__1.json": json.dumps({"events": [{"file": ORIGINAL, "type": "duplicate", "index": 3}]}),
+        "electricity/zone=NO1/year=2025/month=01/.2025_01_03.json.tmp": "{}",  # a writer's temp file
+    }
+    for relative, text in files.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}", encoding="utf-8")
+        path.write_text(text, encoding="utf-8")
 
 
-def _files(root: Path):
-    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
-
-
-def test_setup_freezes_the_input_once_and_links_the_subsets(tmp_path):
+def test_setup_freezes_the_input_and_builds_the_bigger_ones(tmp_path):
     source, paths = tmp_path / "source", perf.Paths(tmp_path / "perf")
     _write_source(source)
 
     sizes = perf.freeze_input(source, paths)
 
-    assert sizes["full"]["files"] == 3 and sizes["1y"]["files"] == 2 and sizes["1m"]["files"] == 1
-    assert _files(paths.input / "1m") == [
-        "_manifests/run__1.json", "electricity/zone=NO1/year=2025/month=01/2025_01_01.json",
-    ]
-    assert ".2025_01_02.json.tmp" not in " ".join(_files(paths.input / "full"))  # a writer's temp file
+    full, x5, x10 = paths.input_dir("x1"), paths.input_dir("x5"), paths.input_dir("x10")
+    assert {name: s["files"] for name, s in sizes.items()} == {"x1": 3, "x5": 15, "x10": 30}
+    assert sorted(p.name for p in (x10 / "electricity").iterdir()) == \
+        ["zone=NO1"] + [f"zone=NO1_r{k}" for k in range(1, 10)]
+    assert sorted(p.name for p in (x5 / "weather").iterdir()) == \
+        ["station=SN18700"] + [f"station=SN18700_r{k}" for k in range(1, 5)]
+    assert perf.replica_suffixes(x5) == ["", "_r1", "_r2", "_r3", "_r4"] and perf.replica_suffixes(full) == [""]
 
-    # A second setup keeps the frozen copy: new source files must not change later measurements.
+    assert os.path.samefile(full / ORIGINAL, x10 / ORIGINAL)  # the originals are links: no extra disk
+    assert not os.path.samefile(full / ORIGINAL, x10 / COPY_3)  # the copies in x10 are real copies
+    assert (x10 / COPY_3).read_text(encoding="utf-8") == '{"payload": [1]}'  # with unchanged content
+    assert os.path.samefile(x10 / COPY_3, x5 / COPY_3)  # x5 links to x10's copies
+    assert not list(full.rglob("*.tmp"))
+
+    # The chaos score stays meaningful: each copy has the same injected errors, under its own folders.
+    manifest = json.loads((x10 / "_manifests" / "run__replica_r3.json").read_text(encoding="utf-8"))
+    assert manifest["events"] == [{"file": COPY_3, "type": "duplicate", "index": 3}]
+
+    # A second setup changes nothing, so every batch measures the same data.
     (source / "electricity/zone=NO1/year=2025/month=01/2025_01_03.json").write_text("{}", encoding="utf-8")
-    assert perf.freeze_input(source, paths)["full"]["files"] == 3
+    assert perf.freeze_input(source, paths)["x10"]["files"] == 30
+    assert json.loads((paths.results / "input.json").read_text(encoding="utf-8"))["inputs"]["x5"]["files"] == 15
+    assert ORIGINAL in {p.relative_to(source).as_posix() for p in source.rglob("*.json")}  # the source is untouched
 
-    # Setup never changes the source.
-    assert "_manifests/run__1.json" in _files(source)
+
+def test_setup_refuses_when_the_copies_would_not_fit(tmp_path, monkeypatch):
+    source, paths = tmp_path / "source", perf.Paths(tmp_path / "perf")
+    _write_source(source)
+    monkeypatch.setattr(perf.shutil, "disk_usage", lambda _: SimpleNamespace(free=1024))
+
+    with pytest.raises(OSError, match="Not enough disk space"):
+        perf.freeze_input(source, paths)
+
+    assert paths.input_dir("x1").is_dir() and not paths.input_dir("x10").exists()
+    assert not list(paths.input.glob("*.partial"))
 
 
 def test_setup_refuses_a_folder_that_is_not_a_chaos_copy(tmp_path):
@@ -187,56 +227,81 @@ def test_setup_refuses_a_folder_that_is_not_a_chaos_copy(tmp_path):
         perf.freeze_input(tmp_path / "missing", perf.Paths(tmp_path / "perf"))
 
 
-def _run_row(variant, repeat, seconds, batch="cache", status="SUCCESS", fingerprint="same", warmup=False, **extra):
-    return {"session": "s1", "batch": batch, "variant": variant, "repeat": repeat, "is_warmup": str(warmup),
-            "status": status, "elapsed_s": seconds, "fingerprint": fingerprint, "input": "full", **extra}
+def test_results_of_an_older_script_are_kept_beside(tmp_path):
+    path = tmp_path / "runs.csv"
+    path.write_text("session,batch,adaptive\ns0,cores,True\n", encoding="utf-8")
+
+    perf._append_rows(path, ["session", "batch"], [{"session": "s1", "batch": "scale"}])
+    perf._append_rows(path, ["session", "batch"], [{"session": "s2", "batch": "scale"}])
+
+    assert (tmp_path / "runs.earlier-1.csv").read_text(encoding="utf-8").startswith("session,batch,adaptive")
+    assert path.read_text(encoding="utf-8").splitlines() == ["session,batch", "s1,scale", "s2,scale"]
+    assert not (tmp_path / "runs.earlier-2.csv").exists()
 
 
-def test_summary_judges_each_variant_against_the_reference():
+# ---------------------------------------------------------------------- #
+# The summary
+# ---------------------------------------------------------------------- #
+def _row(variant, input_, repeat, seconds, rows=(10, 20, 10), status="SUCCESS", warmup=False, session="s1",
+         batch="scale", **extra):
+    prices, weather, zone = rows
+    return {"session": session, "batch": batch, "variant": variant, "input": input_, "repeat": str(repeat),
+            "is_warmup": str(warmup), "status": status, "elapsed_s": str(seconds),
+            "fingerprint": f"prices={prices}|weather_hourly={weather}|zone_hourly={zone}|issues=1|price_sum=1.00",
+            **extra}
+
+
+def _line(summary: str, start: str) -> str:
+    return next(line for line in summary.splitlines() if line.startswith(start))
+
+
+def test_the_scale_summary_compares_on_the_same_input():
     rows = [
-        _run_row("all_on", 0, 999.0, warmup=True),  # the warm-up must not count
-        _run_row("all_on", 1, 10.0),
-        _run_row("all_on", 2, 11.0),
-        _run_row("bronze_only", 1, 20.0),
-        _run_row("bronze_only", 2, 21.0, fingerprint="different"),
-        _run_row("all_off", 1, 1200.0, status="TIMEOUT", error="over 20 min"),
+        _row("cluster_x1", "x1", 0, 999, warmup=True),  # the warm-up must not count
+        _row("cluster_x1", "x1", 1, 60), _row("cluster_x1", "x1", 2, 62),
+        _row("one_vm_x1", "x1", 1, 50), _row("one_vm_x1", "x1", 2, 52),
+        _row("cluster_x5", "x5", 1, 200, rows=(50, 100, 50)), _row("cluster_x5", "x5", 2, 210, rows=(50, 100, 50)),
+        _row("one_vm_x5", "x5", 1, 300, rows=(50, 100, 50)), _row("one_vm_x5", "x5", 2, 320, rows=(50, 100, 51)),
+        _row("cluster_x10", "x10", 1, 400, rows=(100, 200, 99)), _row("cluster_x10", "x10", 2, 410, rows=(100, 200, 99)),
+        _row("one_vm_x10", "x10", 1, 1800, status="TIMEOUT", error="over 30 min"),
     ]
 
-    lines = perf.build_summary(rows, []).splitlines()
+    summary = perf.build_summary(rows, {"x1": {"mb": 337.6}, "x5": {"mb": 1688.0}})
 
-    reference = next(line for line in lines if line.startswith("| all_on | 2 "))
-    assert "10.5" in reference and "10.0–11.0" in reference and "reference" in reference
-    slower = next(line for line in lines if line.startswith("| bronze_only | 2 "))
-    assert "+95%" in slower and "slower" in slower and "**NO**" in slower  # a different output is flagged
-    assert any(line.startswith("| all_off | 0 ") and "TIMEOUT: over 20 min" in line for line in lines)
+    reference = _line(summary, "| cluster_x1 |")
+    assert "| 61.0 |" in reference and "reference" in reference
+    one_vm = _line(summary, "| one_vm_x1 |")
+    assert "-16%" in one_vm and "faster" in one_vm and "| yes |" in one_vm
+    # x5 is compared with the cluster at x5, not at x1; its reference has five times the rows of x1.
+    assert "reference" in _line(summary, "| cluster_x5 |") and "rows ×5" in _line(summary, "| cluster_x5 |")
+    assert "+51%" in _line(summary, "| one_vm_x5 |") and "slower" in _line(summary, "| one_vm_x5 |")
+    assert "**NO**" in _line(summary, "| one_vm_x5 |")  # one run's output differs from the reference's
+    assert "**NO**" in _line(summary, "| cluster_x10 |")  # not ten times the rows of x1
+    assert "TIMEOUT: over 30 min" in _line(summary, "| one_vm_x10 |")
+
+    assert "| x1 | 337.6 | 61.0 | 51.0 | -16% |" in summary
+    assert "| x5 | 1688.0 | 205.0 | 310.0 | +51% |" in summary
+    assert "| x10 | – | 405.0 | – | – |" in summary
 
 
-def test_summary_uses_the_newest_session_of_a_batch():
-    old = _run_row("all_on", 1, 500.0)
-    new = {**_run_row("all_on", 1, 10.0), "session": "s2"}
+def test_the_summary_uses_the_newest_session_and_skips_old_batches():
+    rows = [
+        _row("cluster_x1", "x1", 1, 500.0),
+        _row("cluster_x1", "x1", 1, 10.0, session="s2"),
+        _row("cluster", "x1", 1, 42.0, batch="cores"),  # a batch this version no longer has
+    ]
 
-    summary = perf.build_summary([old, new], [])
+    summary = perf.build_summary(rows)
 
-    assert "| all_on | 1 | 10.0 " in summary and "500" not in summary
-
-
-def test_summary_of_the_read_tests():
-    explicit = {"session": "s1", "test": "schema", "variant": "explicit", "status": "SUCCESS", "seconds": "2.0",
-                "inference_s": "0", "files_read": "10", "tasks_per_query": "4", "input_mb_per_query": "1"}
-    inferred = {"session": "s1", "test": "schema", "variant": "inferred", "status": "SUCCESS", "seconds": "6.0",
-                "inference_s": "3", "files_read": "10", "tasks_per_query": "8", "input_mb_per_query": "2"}
-
-    summary = perf.build_summary([], [explicit, explicit, inferred, inferred])
-
-    assert "| schema | explicit | 2.0 " in summary
-    assert "| schema | inferred | 6.0 | 6.0–6.0 | +200% | slower | 10 | 8 | 2 | 3 |" in summary
+    assert "| cluster_x1 | x1 | 1 | 10.0 " in summary and "500" not in summary
+    assert "cores" not in summary
 
 
 # ---------------------------------------------------------------------- #
 # Real runs, each in its own process
 # ---------------------------------------------------------------------- #
 @pytest.mark.spark
-def test_switching_settings_changes_the_plan_but_not_the_output(bronze, tmp_path):
+def test_a_bigger_input_gives_n_times_the_rows(bronze, tmp_path, monkeypatch):
     pytest.importorskip("pyspark")
     for day in ["2024-01-15", "2024-01-16"]:
         for zone in PRICE_ZONES:
@@ -244,25 +309,28 @@ def test_switching_settings_changes_the_plan_but_not_the_output(bronze, tmp_path
         for station in STATIONS:
             bronze.weather(station, day, weather_records(day, station))
     paths = perf.Paths(tmp_path / "perf")
-    run_chaos_injection(bronze.root, paths.input / "full", rate=0.05, seed=7)
+    run_chaos_injection(bronze.root, paths.input_dir("x1"), rate=0.05, seed=7)
+    monkeypatch.setitem(perf.INPUT_DIRS, "x2", "x2")
+    perf.build_scaled_input(paths.input_dir("x1"), paths.input_dir("x2"), copies=1)
 
     def measure(variant):
         return perf.measure_full_run(paths, "test", variant, 1, "s1", "local[2]", 300)
 
-    usual = measure(perf.Variant("usual", master="local[2]", shuffle_partitions=2))
-    switched = measure(perf.Variant("switched", master="local[2]", shuffle_partitions=2, adaptive=False,
-                                    cache="bronze_only", broadcast="off"))
+    x1 = measure(perf.Variant("x1", master="local[2]"))
+    x2 = measure(perf.Variant("x2", master="local[2]", input="x2", driver_memory="1g"))
 
-    for row in (usual, switched):
+    for row in (x1, x2):
         assert row["status"] == "SUCCESS", row.get("error")
         assert row["elapsed_s"] > 0 and row["jobs"] > 0 and row["tasks"] > 0 and row["hosts"] >= 1
-        assert row["chaos_recall"] == 1.0
+        assert row["zone_hourly_s"] > 0
+        assert row["chaos_recall"] == 1.0  # the copies' errors are found too
         assert not (paths.out / f"test__{row['variant']}__1").exists()  # the output is removed
         assert not list(paths.eventlogs.glob("local-*"))  # the event log too, unless asked to keep it
         assert (paths.results / "plans" / f"test__{row['variant']}.txt").read_text(encoding="utf-8")
         assert (paths.results / "stages" / f"test__{row['variant']}.csv").exists()
 
-    assert usual["broadcast_hash_joins"] > 0
-    assert switched["broadcast_hash_joins"] == 0 and switched["sort_merge_joins"] > usual["sort_merge_joins"]
-    assert usual["zone_hourly_s"] > 0 and switched["zone_hourly_s"] == 0  # timed apart only with the cache on
-    assert usual["fingerprint"] and usual["fingerprint"] == switched["fingerprint"]
+    assert x1["broadcast_hash_joins"] > 0
+    assert x2["driver_memory"] == "1g"
+    base, double = perf._row_counts(x1["fingerprint"]), perf._row_counts(x2["fingerprint"])
+    assert base["zone_hourly"] == 5 * 48
+    assert double == {table: 2 * n for table, n in base.items()}

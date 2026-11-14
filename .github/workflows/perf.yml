@@ -17,12 +17,7 @@ on:
         default: setup
         options:
           - setup
-          - cores
-          - cache
-          - shuffle
-          - broadcast
-          - size
-          - read
+          - scale
       repeats:
         description: 'Measured runs per variant'
         required: false
