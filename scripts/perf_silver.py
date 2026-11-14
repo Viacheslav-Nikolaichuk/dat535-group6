@@ -61,7 +61,10 @@ from config.settings import DATA_ROOT  # noqa: E402
 
 CLUSTER = "cluster"  # replaced by --cluster when a run starts
 DEFAULT_CLUSTER_URL = "spark://spark:7077"
-SINGLE_VM_DRIVER_MEMORY = "4g"  # what the spark VM can spare; cluster runs keep the project's settings
+# The same memory as one cluster executor (3 GB). The spark VM has 7.8 GiB but only about 3 GiB free and no
+# swap: it also runs the cluster's master and worker, the dashboard, the API and the runner. Cluster runs keep
+# the project's settings.
+SINGLE_VM_DRIVER_MEMORY = "3g"
 RUN_TIME_LIMIT_S = 30 * 60
 DEFAULT_REPEATS = 3
 

@@ -268,7 +268,7 @@ The guide asks for tuning "supported by relevant evidence rather than optimizati
 
 | Batch | Compares | Decision it drives |
 |---|---|---|
-| `scale` | One VM (4 GB) against the cluster, at ×1, ×5 and ×10, with the project's own settings | The fixed cost and the cost per GB of each setup; the size where the cluster starts to win; whether a full rebuild (D3) stays acceptable as the data grows |
+| `scale` | One VM (3 GB, the same as one cluster executor) against the cluster, at ×1, ×5 and ×10, with the project's own settings | The fixed cost and the cost per GB of each setup; the size where the cluster starts to win; whether a full rebuild (D3) stays acceptable as the data grows |
 | `shuffle` | 8 shuffle partitions (today), 24 (twice the cluster's 12 cores) or 200 (Spark's default), on the cluster at ×1 and at ×10 | A value that beats 8 at both sizes becomes `DEFAULT_SHUFFLE_PARTITIONS` |
 | `read_tasks` | How many small JSON files one read task gets: `spark.sql.files.openCostInBytes` at Spark's 4 MB (about 32 files per task) or 16 KB (about one task per core), at ×1 and at ×10 | Reading is about half of each run. A winner at both sizes becomes a setting in `get_spark` |
 

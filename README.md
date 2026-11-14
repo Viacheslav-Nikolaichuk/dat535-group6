@@ -318,7 +318,7 @@ python src/silver/run_silver.py --input bronze --output-dir /tmp/silver_clean
 | Batch | What it does |
 |---|---|
 | `setup` | Copies `prod/bronze_chaos` once to `perf/input/full` (×1), then builds ×5 and ×10 by copying every zone and station folder under new names (`zone=NO1_r1`, ...): about 3 GB more |
-| `scale` | One VM (4 GB) against the cluster, at ×1, ×5 and ×10, with the project's own settings |
+| `scale` | One VM (3 GB, the same as one cluster executor) against the cluster, at ×1, ×5 and ×10, with the project's own settings |
 | `shuffle` | 8 (today), 24 or 200 shuffle partitions on the cluster, at the chosen `size` |
 | `read_tasks` | How many small JSON files one read task gets: Spark's default `openCostInBytes` (4 MB) or 16 KB, at the chosen `size` |
 

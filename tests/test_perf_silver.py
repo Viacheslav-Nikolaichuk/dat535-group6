@@ -163,11 +163,11 @@ def test_a_run_gets_only_the_settings_its_variant_sets(tmp_path, monkeypatch):
 
     usual = perf._child_env("spark://spark:7077", perf.Variant("cluster_x1"), paths)
     tuned = perf._child_env("spark://spark:7077", perf.Variant("p24", shuffle_partitions=24), paths)
-    one_vm = perf._child_env("local[*]", perf.Variant("one_vm", master="local[*]", driver_memory="4g"), paths)
+    one_vm = perf._child_env("local[*]", perf.Variant("one_vm", master="local[*]", driver_memory="3g"), paths)
 
     assert "SPARK_SHUFFLE_PARTITIONS" not in usual and "SPARK_DRIVER_MEMORY" not in usual  # the project's settings
     assert tuned["SPARK_SHUFFLE_PARTITIONS"] == "24"
-    assert one_vm["SPARK_DRIVER_MEMORY"] == "4g" and one_vm["SPARK_MASTER"] == "local[*]"
+    assert one_vm["SPARK_DRIVER_MEMORY"] == "3g" and one_vm["SPARK_MASTER"] == "local[*]"
     assert usual["DAT535_ENV"] == "dev" and "GITHUB_STEP_SUMMARY" not in usual  # no Silver summary per run
     assert f"spark.eventLog.dir=file://{paths.eventlogs}" in usual["PYSPARK_SUBMIT_ARGS"]
 
