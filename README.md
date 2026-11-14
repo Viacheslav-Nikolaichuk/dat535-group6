@@ -313,13 +313,16 @@ python src/silver/run_silver.py --input bronze --output-dir /tmp/silver_clean
 
 ## Silver Performance Experiments
 
-`scripts/perf_silver.py` measures how Silver's run time grows with the data, on one VM and on the cluster. It uses a frozen copy of the data and doesn't change Silver's code. The design is in [docs/plans/silver_layer.md](docs/plans/silver_layer.md), section 10. It runs on the VM through a manual workflow: **Actions** -> **Silver Performance** -> **Run workflow**, on branch `dev`, one batch at a time, starting with `setup`.
+`scripts/perf_silver.py` measures how Silver's run time grows with the data, on one VM and on the cluster, and tests the settings that grow with the data. It uses a frozen copy of the data and doesn't change Silver's code. The design is in [docs/plans/silver_layer.md](docs/plans/silver_layer.md), section 10. It runs on the VM through a manual workflow: **Actions** -> **Silver Performance** -> **Run workflow**, on branch `dev`, one batch at a time, starting with `setup`.
 
 | Batch | What it does |
 |---|---|
 | `setup` | Copies `prod/bronze_chaos` once to `perf/input/full` (×1), then builds ×5 and ×10 by copying every zone and station folder under new names (`zone=NO1_r1`, ...): about 3 GB more |
-| `scale` | One VM (4 GB) against the cluster, at ×1, ×5 and ×10 |
+| `scale` | One VM (4 GB) against the cluster, at ×1, ×5 and ×10, with the project's own settings |
+| `shuffle` | 8 (today), 24 or 200 shuffle partitions on the cluster, at the chosen `size` |
+| `read_tasks` | How many small JSON files one read task gets: Spark's default `openCostInBytes` (4 MB) or 16 KB, at the chosen `size` |
 
+* **Order**: `setup`, then `scale`, then `shuffle` and `read_tasks` at `x1` and at `x10`. Two repeats are enough at `x10`, where a run takes several minutes. A value that beats today's setting at both sizes becomes the project's default, and rerunning `scale` then shows the numbers before and after.
 * **Results**: every run's **Artifacts** hold `summary.md` (also on the run's summary page), `runs.csv`, the query plans and the per-stage figures. The newest artifact holds every batch so far, and rerunning a batch replaces it in the summary. Results of an earlier version of the script are kept as `runs.earlier-N.csv`.
 * **Data**: everything stays under `<data root>/perf/`, and each run's output is deleted afterwards. Only `setup` touches prod, and it only reads. `perf/eventlogs/` keeps one Spark event log per batch for the History Server. Delete `perf/input/` to freeze newer data, and the whole `perf/` folder when the experiments are finished.
 * **The runner**: the VM has one runner, so a batch can't overlap a pipeline run, and a scheduled run that comes due waits until the batch has finished. A variant is stopped after 30 minutes and not repeated.

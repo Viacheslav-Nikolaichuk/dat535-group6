@@ -143,6 +143,35 @@ def test_the_scale_batch_compares_one_vm_with_the_cluster_on_each_input():
     assert one_vm.master == "local[*]" and one_vm.driver_memory == perf.SINGLE_VM_DRIVER_MEMORY
 
 
+def test_the_tuning_batches_try_one_setting_against_todays():
+    shuffle = perf.batch_variants("shuffle", "x10")
+    read_tasks = perf.batch_variants("read_tasks", "x10")
+
+    assert [(v.name, v.shuffle_partitions) for v in shuffle] == \
+        [("partitions_8", 8), ("partitions_24", 24), ("partitions_200", 200)]
+    assert [(v.name, v.open_cost_bytes) for v in read_tasks] == \
+        [("open_cost_4mb", 4 * 1024 ** 2), ("open_cost_16kb", 16 * 1024)]
+    for variant in shuffle + read_tasks:
+        assert variant.input == "x10" and variant.master == perf.CLUSTER and variant.driver_memory is None
+
+
+def test_a_run_gets_only_the_settings_its_variant_sets(tmp_path, monkeypatch):
+    for name in ("SPARK_SHUFFLE_PARTITIONS", "SPARK_DRIVER_MEMORY", "GITHUB_STEP_SUMMARY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", "/tmp/summary.md")
+    paths = perf.Paths(tmp_path)
+
+    usual = perf._child_env("spark://spark:7077", perf.Variant("cluster_x1"), paths)
+    tuned = perf._child_env("spark://spark:7077", perf.Variant("p24", shuffle_partitions=24), paths)
+    one_vm = perf._child_env("local[*]", perf.Variant("one_vm", master="local[*]", driver_memory="4g"), paths)
+
+    assert "SPARK_SHUFFLE_PARTITIONS" not in usual and "SPARK_DRIVER_MEMORY" not in usual  # the project's settings
+    assert tuned["SPARK_SHUFFLE_PARTITIONS"] == "24"
+    assert one_vm["SPARK_DRIVER_MEMORY"] == "4g" and one_vm["SPARK_MASTER"] == "local[*]"
+    assert usual["DAT535_ENV"] == "dev" and "GITHUB_STEP_SUMMARY" not in usual  # no Silver summary per run
+    assert f"spark.eventLog.dir=file://{paths.eventlogs}" in usual["PYSPARK_SUBMIT_ARGS"]
+
+
 def test_schedule_warms_up_once_then_takes_turns():
     assert list(perf.schedule(["A", "B"], 2)) == [("A", 0), ("A", 1), ("B", 1), ("A", 2), ("B", 2)]
 
@@ -284,6 +313,23 @@ def test_the_scale_summary_compares_on_the_same_input():
     assert "| x10 | – | 405.0 | – | – |" in summary
 
 
+def test_a_tuning_batch_is_summarised_per_input_size():
+    rows = [
+        _row("partitions_8", "x10", 1, 400, batch="shuffle"), _row("partitions_8", "x10", 2, 410, batch="shuffle"),
+        _row("partitions_24", "x10", 1, 300, batch="shuffle"), _row("partitions_24", "x10", 2, 310, batch="shuffle"),
+        _row("partitions_8", "x1", 1, 60, batch="shuffle"), _row("partitions_8", "x1", 2, 61, batch="shuffle"),
+    ]
+
+    summary = perf.build_summary(rows)
+
+    assert summary.index("## shuffle at x1") < summary.index("## shuffle at x10")
+    at_x10 = summary[summary.index("## shuffle at x10"):]
+    assert "reference" in _line(at_x10, "| partitions_8 |") and "| 405.0 |" in _line(at_x10, "| partitions_8 |")
+    assert "faster" in _line(at_x10, "| partitions_24 |") and "| yes |" in _line(at_x10, "| partitions_24 |")
+    assert "not run" in _line(at_x10, "| partitions_200 |")
+    assert "Time by input size" not in summary  # only the scale batch has that table
+
+
 def test_the_summary_uses_the_newest_session_and_skips_old_batches():
     rows = [
         _row("cluster_x1", "x1", 1, 500.0),
@@ -317,7 +363,9 @@ def test_a_bigger_input_gives_n_times_the_rows(bronze, tmp_path, monkeypatch):
         return perf.measure_full_run(paths, "test", variant, 1, "s1", "local[2]", 300)
 
     x1 = measure(perf.Variant("x1", master="local[2]"))
-    x2 = measure(perf.Variant("x2", master="local[2]", input="x2", driver_memory="1g"))
+    # The tuning settings too, so their way into the run is exercised.
+    x2 = measure(perf.Variant("x2", master="local[2]", input="x2", driver_memory="1g", shuffle_partitions=3,
+                              open_cost_bytes=16 * 1024))
 
     for row in (x1, x2):
         assert row["status"] == "SUCCESS", row.get("error")
@@ -330,7 +378,7 @@ def test_a_bigger_input_gives_n_times_the_rows(bronze, tmp_path, monkeypatch):
         assert (paths.results / "stages" / f"test__{row['variant']}.csv").exists()
 
     assert x1["broadcast_hash_joins"] > 0
-    assert x2["driver_memory"] == "1g"
+    assert (x2["driver_memory"], x2["shuffle_partitions"], x2["open_cost_bytes"]) == ("1g", 3, 16 * 1024)
     base, double = perf._row_counts(x1["fingerprint"]), perf._row_counts(x2["fingerprint"])
     assert base["zone_hourly"] == 5 * 48
     assert double == {table: 2 * n for table, n in base.items()}

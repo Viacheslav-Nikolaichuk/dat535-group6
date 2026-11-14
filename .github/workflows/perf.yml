@@ -18,6 +18,16 @@ on:
         options:
           - setup
           - scale
+          - shuffle
+          - read_tasks
+      size:
+        description: 'Input size for shuffle and read_tasks (setup and scale ignore it)'
+        required: false
+        type: choice
+        default: x1
+        options:
+          - x1
+          - x10
       repeats:
         description: 'Measured runs per variant'
         required: false
@@ -39,6 +49,7 @@ jobs:
       PYSPARK_PYTHON: /home/ubuntu/spark-env/bin/python
       # Inputs are passed via env (not inlined into the script) to prevent shell injection.
       IN_BATCH: ${{ github.event.inputs.batch }}
+      IN_SIZE: ${{ github.event.inputs.size || 'x1' }}
       IN_REPEATS: ${{ github.event.inputs.repeats || '3' }}
 
     steps:
@@ -62,7 +73,8 @@ jobs:
           set -euo pipefail
           source ~/spark-env/bin/activate
           [[ "$IN_REPEATS" =~ ^[1-9][0-9]?$ ]] || { echo "Invalid repeats"; exit 2; }
-          python scripts/perf_silver.py "$IN_BATCH" --repeats "$IN_REPEATS"
+          [[ "$IN_SIZE" =~ ^x(1|10)$ ]] || { echo "Invalid size"; exit 2; }
+          python scripts/perf_silver.py "$IN_BATCH" --size "$IN_SIZE" --repeats "$IN_REPEATS"
 
       # The results so far: the newest run's artifact holds every batch.
       - name: Upload the results

@@ -7,8 +7,13 @@ environment variables and Spark settings. For the bigger inputs, the measuring p
 about the extra zones and stations.
 
 Batches:
-    setup   freeze the input: copy prod/bronze_chaos once (x1), then build x5 and x10 from it
-    scale   one VM against the cluster, at x1, x5 and x10 input
+    setup       freeze the input: copy prod/bronze_chaos once (x1), then build x5 and x10 from it
+    scale       one VM against the cluster, at x1, x5 and x10 input, with the project's own settings
+    shuffle     8, 24 or 200 shuffle partitions on the cluster, at one input size (--size)
+    read_tasks  how many small JSON files one read task gets (openCostInBytes), at one input size
+
+The tuning batches test settings that grow with the data. A value that beats today's setting at x1 and
+x10 becomes the project's default; rerunning scale then gives the numbers before and after.
 
 The bigger inputs hold every zone and station folder of x1, plus 4 or 9 copies of each under new names
 (zone=NO1_r1, station=SN18700_r1, ...). Silver takes the zone or station from the folder name, so the
@@ -28,6 +33,7 @@ Everything stays under <data root>/perf/:
 Usage:
     python scripts/perf_silver.py setup
     python scripts/perf_silver.py scale --repeats 3
+    python scripts/perf_silver.py shuffle --size x10 --repeats 2
     python scripts/perf_silver.py summary
 """
 
@@ -76,21 +82,34 @@ class Variant:
     master: str = CLUSTER
     input: str = "x1"
     driver_memory: Optional[str] = None
+    shuffle_partitions: Optional[int] = None  # the project's default is DEFAULT_SHUFFLE_PARTITIONS (spark_session.py)
+    open_cost_bytes: Optional[int] = None  # spark.sql.files.openCostInBytes; Spark's default is 4 MB
 
 
-BATCH_NAMES = ("scale",)
+BATCH_NAMES = ("scale", "shuffle", "read_tasks")
 
 
-def batch_variants(batch: str) -> List[Variant]:
-    """A batch's variants. On each input, the first one is the reference."""
+def batch_variants(batch: str, size: str = "x1") -> List[Variant]:
+    """A batch's variants. On each input, the first one is the reference: the project's setting today."""
     if batch == "scale":
         return [
             variant
-            for size in SCALES
+            for scale in SCALES
             for variant in (
-                Variant(f"cluster_{size}", input=size),
-                Variant(f"one_vm_{size}", master="local[*]", input=size, driver_memory=SINGLE_VM_DRIVER_MEMORY),
+                Variant(f"cluster_{scale}", input=scale),
+                Variant(f"one_vm_{scale}", master="local[*]", input=scale, driver_memory=SINGLE_VM_DRIVER_MEMORY),
             )
+        ]
+    if batch == "shuffle":
+        # 8 is today's setting, 24 is twice the cluster's 12 cores, and 200 is Spark's default.
+        return [Variant(f"partitions_{n}", input=size, shuffle_partitions=n) for n in (8, 24, 200)]
+    if batch == "read_tasks":
+        # Spark counts every file as at least openCostInBytes when it packs files into read tasks. With
+        # 4 MB a task gets about 32 Bronze files of ~17 KB. With 16 KB, about one file's size, Spark packs
+        # them into a few large tasks, about one per core.
+        return [
+            Variant("open_cost_4mb", input=size, open_cost_bytes=4 * 1024 ** 2),
+            Variant("open_cost_16kb", input=size, open_cost_bytes=16 * 1024),
         ]
     raise KeyError(batch)
 
@@ -107,7 +126,8 @@ RUN_COLUMNS = (
     + ["jobs", "stages", "tasks", "failed_tasks", "hosts", "task_s", "cpu_s", "gc_s", "input_mb", "shuffle_read_mb",
        "shuffle_remote_mb", "shuffle_write_mb", "spill_disk_mb", "slowest_task_s", "worst_skew_ratio"]
     + ["broadcast_hash_joins", "sort_merge_joins", "other_joins", "exchanges", "chaos_recall", "fingerprint"]
-    + ["master", "driver_memory", "load_before", "load_after", "git_commit", "started_at_utc", "error"]
+    + ["master", "driver_memory", "shuffle_partitions", "open_cost_bytes", "load_before", "load_after", "git_commit",
+       "started_at_utc", "error"]
 )
 
 
@@ -413,6 +433,8 @@ def _full_run_child(spec: Dict) -> int:
     input_dir, output_dir = Path(spec["input_dir"]), Path(spec["output_dir"])
     tell_silver_about_copies(silver, input_dir)
     spark = get_spark(app_name=f"perf-{spec['batch']}-{variant.name}")
+    if variant.open_cost_bytes is not None:
+        spark.conf.set("spark.sql.files.openCostInBytes", str(variant.open_cost_bytes))
 
     phases = dict.fromkeys(PHASES, 0.0)
     started = time.perf_counter()
@@ -501,6 +523,8 @@ def _child_env(master: str, variant: Variant, paths: Paths) -> Dict[str, str]:
     })
     if variant.driver_memory:
         env["SPARK_DRIVER_MEMORY"] = variant.driver_memory
+    if variant.shuffle_partitions:
+        env["SPARK_SHUFFLE_PARTITIONS"] = str(variant.shuffle_partitions)
     return env
 
 
@@ -716,7 +740,7 @@ def build_summary(run_rows: List[Dict], input_sizes: Optional[Dict[str, Dict]] =
     known = [key for key in groups if key[0] in BATCH_NAMES]
     order = sorted(known, key=lambda k: (BATCH_NAMES.index(k[0]), list(INPUT_DIRS).index(k[1]) if k[1] in INPUT_DIRS else -1))
     for batch, size in order:
-        variants = batch_variants(batch)
+        variants = batch_variants(batch) if size == "all" else batch_variants(batch, size)
         rows = [r for r in groups[(batch, size)] if r["is_warmup"] != "True"]
         good_by_name = {v.name: [r for r in rows if r["variant"] == v.name and r["status"] == "SUCCESS"]
                         for v in variants}
@@ -797,6 +821,8 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     parser.add_argument("batch", choices=["setup", *BATCH_NAMES, "summary"])
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS, help="measured runs per variant")
+    parser.add_argument("--size", choices=list(INPUT_DIRS), default="x1",
+                        help="input size for shuffle and read_tasks (scale runs every size)")
     parser.add_argument("--cluster", default=DEFAULT_CLUSTER_URL, help="Spark master of the cluster variants")
     parser.add_argument("--time-limit", type=float, default=RUN_TIME_LIMIT_S, help="seconds per run")
     parser.add_argument("--perf-dir", type=Path, default=DATA_ROOT / "perf", help="the experiments' folder")
@@ -812,7 +838,7 @@ def main() -> int:
         print(write_summary(paths))
         return 0
 
-    variants = batch_variants(args.batch)
+    variants = batch_variants(args.batch, args.size)
     missing = sorted({v.input for v in variants if not paths.input_dir(v.input).is_dir()})
     if missing:
         print(f"No frozen input for {', '.join(missing)} in {paths.input}: run the setup batch first.", file=sys.stderr)
