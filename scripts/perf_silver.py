@@ -1,41 +1,46 @@
 """
 Silver performance experiments (docs/plans/silver_layer.md, section 10).
 
-Measures the performance decisions in the Silver code on a frozen copy of the data, without changing
-that code. Settings are switched from outside: environment variables and Spark settings, plus two
-small replacements made in the measuring process only (`DataFrame.cache` and `functions.broadcast`).
+How does Silver's run time grow with the data, on one VM and on the cluster? The script measures this on
+a frozen copy of the data, without changing Silver's code. Settings are switched from outside, with
+environment variables and Spark settings. For the bigger inputs, the measuring process also tells Silver
+about the extra zones and stations.
 
 Batches:
-    setup      freeze the input: copy prod/bronze_chaos once (run this first)
-    cores      the cluster against one VM with all cores, 2 cores and 1 core
-    cache      all caches on, only the Bronze file cache on, all off
-    shuffle    8 or 200 shuffle partitions, each with adaptive execution on and off
-    broadcast  hints on, hints off with Spark choosing, broadcast off
-    size       5 years, 1 year and 1 month of input
-    read       read-only tests: partitioning, schema, small files
+    setup       freeze the input: copy prod/bronze_chaos once (x1), then build x5 and x10 from it
+    scale       one VM against the cluster, at x1, x5 and x10 input, with the project's own settings
+    shuffle     8, 24 or 200 shuffle partitions on the cluster, at one input size (--size)
+    read_tasks  how many small JSON files one read task gets (openCostInBytes), at one input size
+
+The tuning batches test settings that grow with the data. A value that beats today's setting at x1 and
+x10 becomes the project's default; rerunning scale then gives the numbers before and after.
+
+The bigger inputs hold every zone and station folder of x1, plus 4 or 9 copies of each under new names
+(zone=NO1_r1, station=SN18700_r1, ...). Silver takes the zone or station from the folder name, so the
+files stay unchanged and every cleaning rule still applies. This adds zones and stations, not years.
 
 How a batch runs: one warm-up run that is thrown away, then the variants in turn (A, B, C, A, B, C), so
-a noisy period doesn't hit only one of them. Every run is a new process with its own SparkSession. The
-first variant of a batch is its reference. A variant that fails or passes the time limit isn't repeated.
+a noisy period doesn't hit only one of them. Every run is a new process with its own SparkSession. Each
+variant is compared with the batch's first variant on the same input. A variant that fails or passes the
+time limit isn't repeated.
 
 Everything stays under <data root>/perf/:
-    input/     the frozen input (full, 1y, 1m)
+    input/     the frozen input: full (x1), x5 and x10
     out/       scratch output, deleted after each run
     eventlogs/ one Spark event log per batch, for the History Server
-    results/   runs.csv, read_runs.csv, summary.md, plans/, stages/, logs/
+    results/   runs.csv, summary.md, input.json, plans/, stages/, logs/
 
 Usage:
     python scripts/perf_silver.py setup
-    python scripts/perf_silver.py cache --repeats 3
+    python scripts/perf_silver.py scale --repeats 3
+    python scripts/perf_silver.py shuffle --size x10 --repeats 2
     python scripts/perf_silver.py summary
 """
 
 import argparse
-import contextlib
 import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-import io
 import json
 import os
 from pathlib import Path
@@ -56,67 +61,61 @@ from config.settings import DATA_ROOT  # noqa: E402
 
 CLUSTER = "cluster"  # replaced by --cluster when a run starts
 DEFAULT_CLUSTER_URL = "spark://spark:7077"
-EXECUTOR_MEMORY = "3g"
-RUN_TIME_LIMIT_S = 20 * 60
+# The same memory as one cluster executor (3 GB). The spark VM has 7.8 GiB but only about 3 GiB free and no
+# swap: it also runs the cluster's master and worker, the dashboard, the API and the runner. Cluster runs keep
+# the project's settings.
+SINGLE_VM_DRIVER_MEMORY = "3g"
+RUN_TIME_LIMIT_S = 30 * 60
 DEFAULT_REPEATS = 3
 
-# Input subsets, as (year, month) folders. 2025 is the newest complete year when this was written.
-SUBSETS = {"1y": ("2025", None), "1m": ("2025", "01")}
-READ_MONTH = (2025, 1)  # the month the partitioning test asks for
+# Input name -> its folder under input/, and how many times it holds every zone and station.
+INPUT_DIRS = {"x1": "full", "x5": "x5", "x10": "x10"}
+SCALES = {"x1": 1, "x5": 5, "x10": 10}
+REPLICA = "_r"  # zone=NO1_r1 is the first copy of NO1
+DOMAINS = ("electricity", "weather")  # Bronze's domain folders (src/silver/bronze_reader.py)
+DISK_MARGIN_BYTES = 2 * 1024 ** 3  # left free for Spark's shuffle files and Silver's output
+ROW_TABLES = ("prices", "weather_hourly", "zone_hourly")
 
 
 @dataclass(frozen=True)
 class Variant:
-    """One setup of a full Silver run. The defaults are the settings the workflows use."""
+    """One setup of a full Silver run. A field left as None keeps the project's setting."""
 
     name: str
     master: str = CLUSTER
-    input: str = "full"
-    shuffle_partitions: int = 8
-    adaptive: bool = True
-    cache: str = "on"  # on | bronze_only | off
-    broadcast: str = "hint"  # hint | auto | off
+    input: str = "x1"
+    driver_memory: Optional[str] = None
+    shuffle_partitions: Optional[int] = None  # the project's default is DEFAULT_SHUFFLE_PARTITIONS (spark_session.py)
+    open_cost_bytes: Optional[int] = None  # spark.sql.files.openCostInBytes; Spark's default is 4 MB
 
 
-FULL_BATCHES: Dict[str, List[Variant]] = {
-    "cores": [
-        Variant("cluster"),
-        Variant("one_vm_all_cores", master="local[*]"),
-        Variant("one_vm_2_cores", master="local[2]"),
-        Variant("one_vm_1_core", master="local[1]"),
-    ],
-    "cache": [
-        Variant("all_on"),
-        Variant("bronze_only", cache="bronze_only"),
-        Variant("all_off", cache="off"),
-    ],
-    "shuffle": [
-        Variant("p8_adaptive"),
-        Variant("p200_adaptive", shuffle_partitions=200),
-        Variant("p8_no_adaptive", adaptive=False),
-        Variant("p200_no_adaptive", shuffle_partitions=200, adaptive=False),
-    ],
-    "broadcast": [
-        Variant("hints"),
-        Variant("spark_chooses", broadcast="auto"),
-        Variant("off", broadcast="off"),
-    ],
-    "size": [
-        Variant("5_years"),
-        Variant("1_year", input="1y"),
-        Variant("1_month", input="1m"),
-    ],
-}
+BATCH_NAMES = ("scale", "shuffle", "read_tasks")
 
-# The read batch: test -> variants (the first is the reference), and queries per process.
-READ_TESTS: Dict[str, List[str]] = {
-    "partition_one_month": ["partitioned", "unpartitioned"],
-    "partition_whole_table": ["partitioned", "unpartitioned"],
-    "schema": ["explicit", "inferred"],
-    "small_files": ["default_tasks", "fewer_tasks", "compacted_parquet"],
-}
-QUERIES_PER_PROCESS = {"partition_one_month": 5, "partition_whole_table": 5, "schema": 1, "small_files": 1}
-LOW_OPEN_COST_BYTES = 16 * 1024  # about the size of one Bronze file; Spark's default is 4 MB
+
+def batch_variants(batch: str, size: str = "x1") -> List[Variant]:
+    """A batch's variants. On each input, the first one is the reference: the project's setting today."""
+    if batch == "scale":
+        return [
+            variant
+            for scale in SCALES
+            for variant in (
+                Variant(f"cluster_{scale}", input=scale),
+                Variant(f"one_vm_{scale}", master="local[*]", input=scale, driver_memory=SINGLE_VM_DRIVER_MEMORY),
+            )
+        ]
+    if batch == "shuffle":
+        # 8 is today's setting, 24 is twice the cluster's 12 cores, and 200 is Spark's default.
+        return [Variant(f"partitions_{n}", input=size, shuffle_partitions=n) for n in (8, 24, 200)]
+    if batch == "read_tasks":
+        # Spark counts every file as at least openCostInBytes when it packs files into read tasks. With
+        # 4 MB a task gets about 32 Bronze files of ~17 KB. With 16 KB, about one file's size, Spark packs
+        # them into a few large tasks, about one per core.
+        return [
+            Variant("open_cost_4mb", input=size, open_cost_bytes=4 * 1024 ** 2),
+            Variant("open_cost_16kb", input=size, open_cost_bytes=16 * 1024),
+        ]
+    raise KeyError(batch)
+
 
 SQL_PLAN_EVENTS = (
     "org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionStart",
@@ -125,16 +124,14 @@ SQL_PLAN_EVENTS = (
 
 PHASES = ["read_clean", "zone_hourly", "checks", "chaos_score", "scorecard", "write", "other"]
 RUN_COLUMNS = (
-    ["session", "batch", "variant", "repeat", "is_warmup", "status", "elapsed_s"]
+    ["session", "batch", "variant", "input", "repeat", "is_warmup", "status", "elapsed_s"]
     + [f"{p}_s" for p in PHASES]
     + ["jobs", "stages", "tasks", "failed_tasks", "hosts", "task_s", "cpu_s", "gc_s", "input_mb", "shuffle_read_mb",
        "shuffle_remote_mb", "shuffle_write_mb", "spill_disk_mb", "slowest_task_s", "worst_skew_ratio"]
     + ["broadcast_hash_joins", "sort_merge_joins", "other_joins", "exchanges", "chaos_recall", "fingerprint"]
-    + ["master", "shuffle_partitions", "adaptive", "cache", "broadcast", "input", "load_before", "load_after",
-       "git_commit", "started_at_utc", "error"]
+    + ["master", "driver_memory", "shuffle_partitions", "open_cost_bytes", "load_before", "load_after", "git_commit",
+       "started_at_utc", "error"]
 )
-READ_COLUMNS = ["session", "test", "variant", "process", "query", "status", "seconds", "inference_s", "files_read",
-                "tasks_per_query", "input_mb_per_query", "git_commit", "error"]
 
 
 @dataclass(frozen=True)
@@ -144,6 +141,9 @@ class Paths:
     @property
     def input(self) -> Path:
         return self.root / "input"
+
+    def input_dir(self, name: str) -> Path:
+        return self.input / INPUT_DIRS[name]
 
     @property
     def out(self) -> Path:
@@ -159,47 +159,105 @@ class Paths:
 
 
 # ---------------------------------------------------------------------- #
-# Freezing the input
+# Freezing the input, and the bigger inputs
 # ---------------------------------------------------------------------- #
 def freeze_input(source: Path, paths: Paths) -> Dict[str, Dict[str, float]]:
-    """Copy `source` once into input/full and link the subsets. An existing copy is never replaced."""
-    full = paths.input / "full"
+    """Copy `source` once into input/full (x1), then build x10 and x5 from it.
+
+    An existing input is never replaced, so every batch measures the same data. The biggest input gets
+    real copies, so they take disk and memory as growing data would. The others link to its files.
+    """
+    full = paths.input_dir("x1")
     paths.input.mkdir(parents=True, exist_ok=True)
     if not full.exists():
         if not (source / "_manifests").is_dir():
             raise FileNotFoundError(f"{source} is not a chaos copy: it has no _manifests folder")
-        partial = paths.input / "full.partial"
+        partial = full.with_name(full.name + ".partial")
         shutil.rmtree(partial, ignore_errors=True)
         # Hidden names are the writers' temp files.
         shutil.copytree(source, partial, ignore=shutil.ignore_patterns(".*"))
         os.replace(partial, full)
 
-    for name, (year, month) in SUBSETS.items():
-        target = paths.input / name
-        if not target.exists():
-            partial = paths.input / f"{name}.partial"
-            shutil.rmtree(partial, ignore_errors=True)
-            # Hard links: a subset takes no extra disk space.
-            shutil.copytree(full, partial, ignore=_subset_filter(year, month), copy_function=os.link)
-            os.replace(partial, target)
+    largest = max(SCALES, key=SCALES.get)
+    for name in sorted(SCALES, key=SCALES.get, reverse=True):
+        copies, target = SCALES[name] - 1, paths.input_dir(name)
+        if copies == 0 or target.exists():
+            continue
+        if name == largest:
+            _check_disk_space(full, copies, paths.input)
+            build_scaled_input(full, target, copies)
+        else:
+            build_scaled_input(full, target, copies, link_copies_from=paths.input_dir(largest))
 
-    sizes = {}
-    for name in ["full", *SUBSETS]:
-        files = [p for p in (paths.input / name).rglob("*.json") if "_manifests" not in p.parts]
-        sizes[name] = {"files": len(files), "mb": round(sum(p.stat().st_size for p in files) / 1e6, 1)}
+    sizes = {name: _input_size(paths.input_dir(name)) for name in SCALES if paths.input_dir(name).exists()}
     paths.results.mkdir(parents=True, exist_ok=True)
     (paths.results / "input.json").write_text(json.dumps({"source": str(source), "inputs": sizes}, indent=2), "utf-8")
     return sizes
 
 
-def _subset_filter(year: str, month: Optional[str]) -> Callable[[str, List[str]], List[str]]:
-    def ignore(_folder: str, names: List[str]) -> List[str]:
-        return [
-            n for n in names
-            if (n.startswith("year=") and n != f"year={year}")
-            or (month is not None and n.startswith("month=") and n != f"month={month}")
-        ]
-    return ignore
+def build_scaled_input(full: Path, target: Path, copies: int, link_copies_from: Optional[Path] = None) -> None:
+    """`target`: every file of `full` (hard links) plus `copies` copies of each zone and station folder.
+
+    The copies are real copies, or hard links to the same copies in `link_copies_from`. One extra chaos
+    manifest per copy lists the same injected errors under the copy's folders, so the chaos score still
+    means something.
+    """
+    partial = target.with_name(target.name + ".partial")
+    shutil.rmtree(partial, ignore_errors=True)
+    shutil.copytree(full, partial, copy_function=os.link)
+    for domain in DOMAINS:
+        if not (full / domain).is_dir():
+            continue
+        for entity in sorted(p for p in (full / domain).iterdir() if p.is_dir()):
+            for k in range(1, copies + 1):
+                name = f"{entity.name}{REPLICA}{k}"
+                if link_copies_from is None:
+                    shutil.copytree(entity, partial / domain / name)
+                else:
+                    shutil.copytree(link_copies_from / domain / name, partial / domain / name, copy_function=os.link)
+    events = _chaos_events(full)
+    for k in range(1, copies + 1):
+        manifest = {"replica": k, "events": [{**e, "file": replica_path(e["file"], k)} for e in events]}
+        (partial / "_manifests" / f"run__replica{REPLICA}{k}.json").write_text(json.dumps(manifest), "utf-8")
+    os.replace(partial, target)
+
+
+def replica_path(relative: str, k: int) -> str:
+    """electricity/zone=NO1/year=... becomes electricity/zone=NO1_r2/year=... for copy 2."""
+    domain, entity, rest = relative.split("/", 2)
+    return f"{domain}/{entity}{REPLICA}{k}/{rest}"
+
+
+def replica_suffixes(input_dir: Path) -> List[str]:
+    """'' for the original zones and stations, then '_r1', '_r2', ... for the copies in a bigger input."""
+    copies = {int(p.name.rsplit(REPLICA, 1)[1]) for p in (input_dir / "electricity").glob(f"zone=*{REPLICA}*")}
+    return [""] + [f"{REPLICA}{k}" for k in sorted(copies)]
+
+
+def _chaos_events(folder: Path) -> List[Dict]:
+    """Every error the chaos injector recorded for `folder` (as src/silver/quality.load_chaos_events reads them)."""
+    events: List[Dict] = []
+    for path in sorted((folder / "_manifests").glob("run__*.json")):
+        events.extend(json.loads(path.read_text(encoding="utf-8")).get("events", []))
+    return events
+
+
+def _data_files(folder: Path) -> List[Path]:
+    return [p for p in folder.rglob("*.json") if "_manifests" not in p.relative_to(folder).parts]
+
+
+def _input_size(folder: Path) -> Dict[str, float]:
+    files = _data_files(folder)
+    return {"files": len(files), "mb": round(sum(p.stat().st_size for p in files) / 1e6, 1)}
+
+
+def _check_disk_space(full: Path, copies: int, where: Path) -> None:
+    """Refuse to start copying when the copies wouldn't fit, with room to spare for the runs."""
+    needed = copies * sum(p.stat().st_size for p in _data_files(full)) + DISK_MARGIN_BYTES
+    free = shutil.disk_usage(where).free
+    if free < needed:
+        raise OSError(f"Not enough disk space for the bigger inputs: {free / 1e9:.1f} GB free, "
+                      f"{needed / 1e9:.1f} GB needed")
 
 
 # ---------------------------------------------------------------------- #
@@ -354,47 +412,17 @@ def compare(reference: Sequence[float], values: Sequence[float]) -> str:
 # ---------------------------------------------------------------------- #
 # Inside the measuring process (one SparkSession per process)
 # ---------------------------------------------------------------------- #
-def _apply_cache_mode(mode: str) -> None:
-    """Make DataFrame.cache do nothing, optionally except in the Bronze reader."""
-    if mode == "on":
+def tell_silver_about_copies(silver, input_dir: Path) -> None:
+    """A bigger input has more zones and stations than config/zones_and_stations.json lists."""
+    suffixes = replica_suffixes(input_dir)
+    if len(suffixes) == 1:
         return
-    from pyspark.sql import DataFrame
+    from src.silver.reference import DIM_STATION_SCHEMA, station_rows
 
-    real_cache = DataFrame.cache
-
-    def cache(self):
-        if mode == "bronze_only" and sys._getframe(1).f_code.co_name == "read_bronze_files":
-            return real_cache(self)
-        return self
-
-    DataFrame.cache = cache
-
-
-def _apply_broadcast_mode(mode: str) -> None:
-    """Make functions.broadcast do nothing, so Spark chooses the join itself."""
-    if mode == "hint":
-        return
-    from pyspark.sql import functions
-
-    functions.broadcast = lambda df: df
-
-
-def _plan_text(df) -> str:
-    buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
-        df.explain()
-    return buffer.getvalue()
-
-
-def _session(app_name: str, adaptive: bool = True, no_auto_broadcast: bool = False):
-    from src.silver.spark_session import get_spark
-
-    spark = get_spark(app_name=app_name)
-    spark.conf.set("spark.sql.adaptive.enabled", str(adaptive).lower())
-    if no_auto_broadcast:
-        spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
-        spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1")
-    return spark
+    zones = list(silver.PRICE_ZONES)
+    silver.PRICE_ZONES = [zone + s for s in suffixes for zone in zones]
+    rows = [(station + s, name, zone + s, *rest) for s in suffixes for station, name, zone, *rest in station_rows()]
+    silver.build_dim_station = lambda spark: spark.createDataFrame(rows, DIM_STATION_SCHEMA)
 
 
 def _full_run_child(spec: Dict) -> int:
@@ -402,11 +430,14 @@ def _full_run_child(spec: Dict) -> int:
     from pyspark.sql import functions as F
 
     from src.silver import run_silver as silver
+    from src.silver.spark_session import get_spark
 
     variant = Variant(**spec["variant"])
-    _apply_cache_mode(variant.cache)
-    _apply_broadcast_mode(variant.broadcast)
-    spark = _session(f"perf-{spec['batch']}-{variant.name}", variant.adaptive, variant.broadcast == "off")
+    input_dir, output_dir = Path(spec["input_dir"]), Path(spec["output_dir"])
+    tell_silver_about_copies(silver, input_dir)
+    spark = get_spark(app_name=f"perf-{spec['batch']}-{variant.name}")
+    if variant.open_cost_bytes is not None:
+        spark.conf.set("spark.sql.files.openCostInBytes", str(variant.open_cost_bytes))
 
     phases = dict.fromkeys(PHASES, 0.0)
     started = time.perf_counter()
@@ -425,12 +456,11 @@ def _full_run_child(spec: Dict) -> int:
     def checks(*args, **kwargs):
         # Everything up to here is reading and cleaning: the first actions materialize those caches.
         phases["read_clean"] = time.perf_counter() - started
-        if variant.cache == "on":
-            # zone_hourly is lazy, so it would otherwise count as the first check's time. With the
-            # cache on, this count does the work that check would do, and the check then reuses it.
-            begin = time.perf_counter()
-            args[2].count()
-            phases["zone_hourly"] = time.perf_counter() - begin
+        # zone_hourly is lazy and cached, so it would otherwise count as the first check's time. This
+        # count does the work that check would do, and the check then reuses it.
+        begin = time.perf_counter()
+        args[2].count()
+        phases["zone_hourly"] = time.perf_counter() - begin
         return timed("checks", real_checks)(*args, **kwargs)
 
     silver.run_checks = checks
@@ -439,8 +469,7 @@ def _full_run_child(spec: Dict) -> int:
     silver.write_table = timed("write", silver.write_table)
     silver.publish = timed("write", silver.publish)
 
-    output_dir = Path(spec["output_dir"])
-    exit_code = silver.run_silver(Path(spec["input_dir"]), output_dir, "bronze_chaos", spark=spark)
+    exit_code = silver.run_silver(input_dir, output_dir, "bronze_chaos", spark=spark)
     elapsed = time.perf_counter() - started
     phases["other"] = max(0.0, elapsed - sum(phases.values()))
 
@@ -452,7 +481,7 @@ def _full_run_child(spec: Dict) -> int:
             F.sum("price_nok_kwh").alias("price"), F.sum("temp_celsius").alias("temp")
         ).first()
         fingerprint = "|".join([
-            *(f"{t}={manifest['rows'][t]}" for t in ("prices", "weather_hourly", "zone_hourly")),
+            *(f"{t}={manifest['rows'][t]}" for t in ROW_TABLES),
             f"issues={sum(i['count'] for i in manifest['issues'])}",
             f"price_sum={totals.price:.2f}",
             f"temp_sum={totals.temp:.2f}",
@@ -470,91 +499,6 @@ def _full_run_child(spec: Dict) -> int:
     return exit_code
 
 
-def _read_all_domains(spark, input_dir: Path, inferred: bool = False) -> Tuple[List, float]:
-    """The Bronze envelopes of both domains, and the seconds spent inferring their schemas."""
-    from src.silver.bronze_reader import DOMAIN_PRICES, DOMAIN_WEATHER, ENVELOPE_SCHEMAS
-
-    frames, inference_s = [], 0.0
-    for domain in (DOMAIN_PRICES, DOMAIN_WEATHER):
-        reader = spark.read.option("multiLine", True).option("mode", "PERMISSIVE") \
-            .option("columnNameOfCorruptRecord", "_corrupt_record")
-        begin = time.perf_counter()
-        if inferred:
-            frames.append(reader.json(str(input_dir / domain)))  # reads every file to learn the schema
-            inference_s += time.perf_counter() - begin
-        else:
-            frames.append(reader.schema(ENVELOPE_SCHEMAS[domain]).json(str(input_dir / domain)))
-    return frames, inference_s
-
-
-def _prepare_read_child(spec: Dict) -> int:
-    """Build the tables the read tests use. Not measured."""
-    from src.silver import run_silver as silver
-    from src.silver.bronze_reader import DOMAIN_PRICES, DOMAIN_WEATHER
-
-    spark = _session("perf-read-prepare")
-    work, input_dir = Path(spec["work_dir"]), Path(spec["input_dir"])
-    code = silver.run_silver(input_dir, work / "silver", "bronze_chaos", spark=spark)
-    if code != silver.EXIT_OK:
-        return code
-    spark.read.parquet(str(work / "silver" / "zone_hourly")).coalesce(1).write.mode("overwrite") \
-        .parquet(str(work / "zone_hourly_unpartitioned"))
-    frames, _ = _read_all_domains(spark, input_dir)
-    for domain, frame in zip((DOMAIN_PRICES, DOMAIN_WEATHER), frames):
-        frame.select("payload").coalesce(1).write.mode("overwrite").parquet(str(work / "bronze_compact" / domain))
-    spark.stop()
-    return 0
-
-
-def _read_child(spec: Dict) -> int:
-    """Run one read test's query several times. Writes spec['result_file']."""
-    from pyspark.sql import functions as F
-
-    from src.silver.bronze_reader import DOMAIN_PRICES, DOMAIN_WEATHER
-
-    test, variant = spec["test"], spec["variant"]
-    work, input_dir = Path(spec["work_dir"]), Path(spec["input_dir"])
-    spark = _session(f"perf-read-{test}-{variant}")
-    measured = []
-    plan, files_read = "", 0
-    # With several queries per process, the first one is a cold start and is thrown away.
-    warmups = 1 if spec["queries"] > 1 else 0
-
-    for query_number in range(warmups + spec["queries"]):
-        begin = time.perf_counter()
-        inference_s = 0.0
-        if test.startswith("partition_"):
-            table = "silver/zone_hourly" if variant == "partitioned" else "zone_hourly_unpartitioned"
-            df = spark.read.parquet(str(work / table))
-            if test == "partition_one_month":
-                df = df.filter((F.col("year") == READ_MONTH[0]) & (F.col("month") == READ_MONTH[1]))
-            query = df.agg(F.avg("price_nok_kwh"))
-            query.first()
-            plan, files_read = _plan_text(query), len(df.inputFiles())
-        else:
-            if variant == "compacted_parquet":
-                frames = [spark.read.parquet(str(work / "bronze_compact" / d)) for d in (DOMAIN_PRICES, DOMAIN_WEATHER)]
-            else:
-                if variant == "fewer_tasks":
-                    spark.conf.set("spark.sql.files.openCostInBytes", str(LOW_OPEN_COST_BYTES))
-                frames, inference_s = _read_all_domains(spark, input_dir, inferred=variant == "inferred")
-            # The same forced parse for every variant: JSON is only parsed for the columns a query needs.
-            for frame in frames:
-                frame.select(F.sum(F.size("payload"))).first()
-            files_read = sum(len(frame.inputFiles()) for frame in frames)
-        if query_number >= warmups:
-            measured.append({"seconds": round(time.perf_counter() - begin, 3), "inference_s": round(inference_s, 3)})
-
-    Path(spec["result_file"]).write_text(json.dumps({
-        "measured": measured,
-        "files_read": files_read,
-        "plan": plan,
-        "app_id": spark.sparkContext.applicationId,
-    }), "utf-8")
-    spark.stop()
-    return 0
-
-
 # ---------------------------------------------------------------------- #
 # The measuring loop (the parent process)
 # ---------------------------------------------------------------------- #
@@ -569,20 +513,21 @@ def _git_commit() -> str:
         return ""
 
 
-def _child_env(master: str, shuffle_partitions: int, paths: Paths) -> Dict[str, str]:
+def _child_env(master: str, variant: Variant, paths: Paths) -> Dict[str, str]:
     env = dict(os.environ)
     env.pop("GITHUB_STEP_SUMMARY", None)  # Silver would add its own summary for every run
     env.update({
-        "DAT535_ENV": "dev",  # this script's runs pass their own folders; prod is never the default
+        "DAT535_ENV": "dev",  # the runs pass their own folders; prod is never the default
         "SPARK_MASTER": master,
-        "SPARK_SHUFFLE_PARTITIONS": str(shuffle_partitions),
-        "SPARK_EXECUTOR_MEMORY": EXECUTOR_MEMORY,
         "PYSPARK_PYTHON": os.environ.get("PYSPARK_PYTHON", sys.executable),
         "PYSPARK_SUBMIT_ARGS": (
-            f"--conf spark.eventLog.enabled=true --conf spark.eventLog.dir=file://{paths.eventlogs} "
-            f"--conf spark.executor.memory={EXECUTOR_MEMORY} pyspark-shell"
+            f"--conf spark.eventLog.enabled=true --conf spark.eventLog.dir=file://{paths.eventlogs} pyspark-shell"
         ),
     })
+    if variant.driver_memory:
+        env["SPARK_DRIVER_MEMORY"] = variant.driver_memory
+    if variant.shuffle_partitions:
+        env["SPARK_SHUFFLE_PARTITIONS"] = str(variant.shuffle_partitions)
     return env
 
 
@@ -611,6 +556,15 @@ def _last_error(log_file: Path) -> str:
 
 
 def _append_rows(path: Path, columns: List[str], rows: List[Dict]) -> None:
+    if path.exists():
+        with open(path, newline="", encoding="utf-8") as file:
+            header = next(csv.reader(file), [])
+        if header != columns:
+            # Results of an earlier version of this script: kept beside, under their own columns.
+            number = 1
+            while path.with_name(f"{path.stem}.earlier-{number}{path.suffix}").exists():
+                number += 1
+            path.rename(path.with_name(f"{path.stem}.earlier-{number}{path.suffix}"))
     is_new = not path.exists()
     with open(path, "a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=columns, extrasaction="ignore")
@@ -652,10 +606,10 @@ def measure_full_run(paths: Paths, batch: str, variant: Variant, repeat: int, se
         "load_before": round(os.getloadavg()[0], 2),
     }
     spec = {
-        "kind": "full", "batch": batch, "variant": asdict(variant), "input_dir": str(paths.input / variant.input),
+        "kind": "full", "batch": batch, "variant": asdict(variant), "input_dir": str(paths.input_dir(variant.input)),
         "output_dir": str(work / "silver"), "result_file": str(work / "result.json"),
     }
-    code = _run_child(spec, _child_env(master, variant.shuffle_partitions, paths), time_limit, work)
+    code = _run_child(spec, _child_env(master, variant, paths), time_limit, work)
     row["load_after"] = round(os.getloadavg()[0], 2)
 
     if code is None:
@@ -690,8 +644,8 @@ def _write_stages(path: Path, stages: List[Dict]) -> None:
         writer.writerows(sorted(stages, key=lambda s: -s["seconds"]))
 
 
-def run_full_batch(paths: Paths, batch: str, repeats: int, cluster: str, time_limit: float) -> bool:
-    variants = FULL_BATCHES[batch]
+def run_full_batch(paths: Paths, batch: str, variants: List[Variant], repeats: int, cluster: str,
+                   time_limit: float) -> bool:
     session = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     stopped = set()
     for variant, repeat in schedule(variants, repeats):
@@ -711,70 +665,6 @@ def run_full_batch(paths: Paths, batch: str, repeats: int, cluster: str, time_li
     return True
 
 
-def run_read_batch(paths: Paths, repeats: int, cluster: str, time_limit: float) -> bool:
-    session = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    paths.eventlogs.mkdir(parents=True, exist_ok=True)
-    (paths.results / "plans").mkdir(parents=True, exist_ok=True)
-    tables = paths.out / "read_tables"
-    shutil.rmtree(tables, ignore_errors=True)
-    tables.mkdir(parents=True)
-    input_dir = paths.input / "full"
-    env = _child_env(cluster, 8, paths)
-
-    # Reads all of Bronze first, so this also warms the disk cache for the tests.
-    print("[read] building the tables for the tests", flush=True)
-    code = _run_child({"kind": "prepare_read", "work_dir": str(tables), "input_dir": str(input_dir)}, env, time_limit,
-                      tables)
-    if code != 0:
-        print(f"[read] preparing failed: {_last_error(tables / 'child.log')}", flush=True)
-        _keep_failure_log(paths, tables, "read__prepare")
-        shutil.rmtree(tables, ignore_errors=True)
-        return False
-
-    commit = _git_commit()
-    stopped = set()
-    tests = [(test, variant) for test, variants in READ_TESTS.items() for variant in variants]
-    for process in range(1, repeats + 1):
-        for test, variant in tests:
-            if (test, variant) in stopped:
-                continue
-            work = paths.out / f"read__{test}__{variant}__{process}"
-            shutil.rmtree(work, ignore_errors=True)
-            work.mkdir(parents=True)
-            spec = {
-                "kind": "read", "test": test, "variant": variant, "queries": QUERIES_PER_PROCESS[test],
-                "work_dir": str(tables), "input_dir": str(input_dir), "result_file": str(work / "result.json"),
-            }
-            code = _run_child(spec, env, time_limit, work)
-            base = {"session": session, "test": test, "variant": variant, "process": process, "git_commit": commit}
-            if code != 0 or not (work / "result.json").exists():
-                error = f"over {time_limit / 60:g} min" if code is None else _last_error(work / "child.log")
-                _append_rows(paths.results / "read_runs.csv", READ_COLUMNS,
-                             [{**base, "status": "TIMEOUT" if code is None else "FAILED", "error": error}])
-                _keep_failure_log(paths, work, f"read__{test}__{variant}__{process}")
-                stopped.add((test, variant))
-                print(f"[read] {test}/{variant}: failed: {error}", flush=True)
-            else:
-                result = json.loads((work / "result.json").read_text(encoding="utf-8"))
-                log_path = paths.eventlogs / result["app_id"]
-                totals = parse_event_log(log_path)["totals"]
-                log_path.unlink(missing_ok=True)
-                queries = len(result["measured"])
-                _append_rows(paths.results / "read_runs.csv", READ_COLUMNS, [
-                    {**base, "status": "SUCCESS", "query": i + 1, **m, "files_read": result["files_read"],
-                     "tasks_per_query": round(totals["tasks"] / queries, 1),
-                     "input_mb_per_query": round(totals["input_mb"] / queries, 2)}
-                    for i, m in enumerate(result["measured"])
-                ])
-                if result["plan"]:
-                    (paths.results / "plans" / f"read__{test}__{variant}.txt").write_text(result["plan"], "utf-8")
-                median = statistics.median(m["seconds"] for m in result["measured"])
-                print(f"[read] {test}/{variant} round {process}/{repeats}: {median} s", flush=True)
-            shutil.rmtree(work, ignore_errors=True)
-    shutil.rmtree(tables, ignore_errors=True)
-    return True
-
-
 # ---------------------------------------------------------------------- #
 # The summary
 # ---------------------------------------------------------------------- #
@@ -782,9 +672,14 @@ def _floats(rows: List[Dict], column: str) -> List[float]:
     return [float(r[column]) for r in rows if r.get(column) not in (None, "")]
 
 
-def _median_text(rows: List[Dict], column: str) -> str:
+def _median(rows: List[Dict], column: str) -> Optional[float]:
     values = _floats(rows, column)
-    return f"{statistics.median(values):g}" if values else "–"
+    return statistics.median(values) if values else None
+
+
+def _median_text(rows: List[Dict], column: str) -> str:
+    value = _median(rows, column)
+    return "–" if value is None else f"{value:g}"
 
 
 def _time_cells(values: List[float], reference: List[float]) -> List[str]:
@@ -797,93 +692,115 @@ def _time_cells(values: List[float], reference: List[float]) -> List[str]:
     return [f"{median:.1f}", f"{min(values):.1f}–{max(values):.1f}", change]
 
 
-def _latest(rows: List[Dict], key: str) -> Dict[str, List[Dict]]:
-    """Rows per batch or test, from its newest session only (a rerun replaces the earlier one)."""
-    grouped: Dict[str, List[Dict]] = {}
+def _row_counts(fingerprint: str) -> Dict[str, int]:
+    parts = dict(p.split("=", 1) for p in (fingerprint or "").split("|") if "=" in p)
+    return {table: int(parts[table]) for table in ROW_TABLES if table in parts}
+
+
+def _group(row: Dict) -> Tuple[str, str]:
+    """A batch's results: scale covers every input, the other batches one input each."""
+    return (row["batch"], "all" if row["batch"] == "scale" else row["input"])
+
+
+def _latest(rows: List[Dict]) -> Dict[Tuple[str, str], List[Dict]]:
+    """Rows per batch, from its newest session only (a rerun replaces the earlier one)."""
+    grouped: Dict[Tuple[str, str], List[Dict]] = {}
     for row in rows:
-        grouped.setdefault(row[key], []).append(row)
-    return {name: [r for r in group if r["session"] == max(x["session"] for x in group)]
-            for name, group in grouped.items()}
+        grouped.setdefault(_group(row), []).append(row)
+    return {key: [r for r in group if r["session"] == max(x["session"] for x in group)]
+            for key, group in grouped.items()}
 
 
-def build_summary(run_rows: List[Dict], read_rows: List[Dict]) -> str:
+def _same_output(variant: Variant, good: List[Dict], references: Dict[str, Variant],
+                 good_by_name: Dict[str, List[Dict]]) -> str:
+    """The reference's fingerprint on the same input; for a bigger input's reference, N times the rows at x1."""
+    reference = references[variant.input]
+    if variant != reference:
+        expected = {r["fingerprint"] for r in good_by_name.get(reference.name, [])}
+        if not expected:
+            return "–"
+        return "yes" if {r["fingerprint"] for r in good} <= expected else "**NO**"
+    base = references.get("x1")
+    if variant.input == "x1" or base is None or not good_by_name.get(base.name):
+        return "–"
+    factor = SCALES[variant.input]
+    base_rows = _row_counts(good_by_name[base.name][0]["fingerprint"])
+    ok = bool(base_rows) and all(
+        _row_counts(r["fingerprint"]) == {t: factor * n for t, n in base_rows.items()} for r in good
+    )
+    return f"rows ×{factor}" if ok else "**NO**"
+
+
+def build_summary(run_rows: List[Dict], input_sizes: Optional[Dict[str, Dict]] = None) -> str:
     lines = [
         "# Silver performance results",
         "",
-        "Median and range of the measured runs. A difference from a batch's first variant counts only if the "
-        "two ranges don't overlap. A run counts only if it ends with SUCCESS.",
+        "Median and range of the measured runs. Each variant is compared with the batch's first variant on the "
+        "same input; a difference counts only if the two ranges don't overlap. A run counts only if it ends with "
+        "SUCCESS.",
     ]
-    batches = _latest(run_rows, "batch")
-    for batch in [b for b in FULL_BATCHES if b in batches]:
-        rows = [r for r in batches[batch] if r["is_warmup"] != "True"]
-        names = [v.name for v in FULL_BATCHES[batch]]
-        by_variant = {n: [r for r in rows if r["variant"] == n] for n in names}
-        reference_rows = [r for r in by_variant[names[0]] if r["status"] == "SUCCESS"]
-        reference = _floats(reference_rows, "elapsed_s")
-        reference_prints = {r["fingerprint"] for r in reference_rows}
+    groups = _latest(run_rows)
+    known = [key for key in groups if key[0] in BATCH_NAMES]
+    order = sorted(known, key=lambda k: (BATCH_NAMES.index(k[0]), list(INPUT_DIRS).index(k[1]) if k[1] in INPUT_DIRS else -1))
+    for batch, size in order:
+        variants = batch_variants(batch) if size == "all" else batch_variants(batch, size)
+        rows = [r for r in groups[(batch, size)] if r["is_warmup"] != "True"]
+        good_by_name = {v.name: [r for r in rows if r["variant"] == v.name and r["status"] == "SUCCESS"]
+                        for v in variants}
+        references: Dict[str, Variant] = {}
+        for variant in variants:
+            references.setdefault(variant.input, variant)
 
-        lines += ["", f"## {batch}", "",
-                  "| Variant | Runs | Median (s) | Range (s) | Change | Verdict | Same output | Hosts | Tasks | "
-                  "Shuffled (MB) | Spilled (MB) | Broadcast joins | Sort-merge joins | Other joins | Shuffles |",
-                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
-        for name in names:
-            group = by_variant[name]
-            good = [r for r in group if r["status"] == "SUCCESS"]
+        title = batch if size == "all" else f"{batch} at {size}"
+        lines += ["", f"## {title}", "",
+                  "| Variant | Input | Runs | Median (s) | Range (s) | Change | Verdict | Same output | Hosts | Tasks | "
+                  "Shuffled (MB) | Spilled (MB) | GC (s) | Broadcast joins | Sort-merge joins | Other joins | Shuffles |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for variant in variants:
+            good = good_by_name[variant.name]
             if not good:
-                problem = group[0] if group else {"status": "not run", "error": ""}
+                tried = [r for r in rows if r["variant"] == variant.name]
+                problem = tried[0] if tried else {"status": "not run", "error": ""}
                 detail = f"{problem['status']}: {problem.get('error') or ''}".strip().rstrip(":").replace("|", "/")
-                lines.append(f"| {name} | 0 | – | – | – | {detail} |" + " – |" * 9)
+                lines.append(f"| {variant.name} | {variant.input} | 0 | – | – | – | {detail} |" + " – |" * 10)
                 continue
+            reference = references[variant.input]
+            reference_times = _floats(good_by_name[reference.name], "elapsed_s")
             times = _floats(good, "elapsed_s")
-            if name == names[0]:
-                verdict, same = "reference", "–"
-            else:
-                verdict = compare(reference, times)
-                if not reference_rows or good[0]["input"] != reference_rows[0]["input"]:
-                    same = "–"
-                else:
-                    same = "yes" if {r["fingerprint"] for r in good} <= reference_prints else "**NO**"
-            cells = [name, str(len(good)), *_time_cells(times, reference), verdict, same]
-            cells += [_median_text(good, c) for c in ("hosts", "tasks", "shuffle_read_mb", "spill_disk_mb",
+            verdict = "reference" if variant == reference else compare(reference_times, times)
+            cells = [variant.name, variant.input, str(len(good)), *_time_cells(times, reference_times), verdict,
+                     _same_output(variant, good, references, good_by_name)]
+            cells += [_median_text(good, c) for c in ("hosts", "tasks", "shuffle_read_mb", "spill_disk_mb", "gc_s",
                                                       "broadcast_hash_joins", "sort_merge_joins", "other_joins",
                                                       "exchanges")]
             lines.append("| " + " | ".join(cells) + " |")
 
+        if batch == "scale":
+            lines += ["", "Time by input size (median seconds):", "",
+                      "| Input | Data (MB) | Cluster | One VM | One VM against the cluster |", "|---|---|---|---|---|"]
+            for size_name in SCALES:
+                cluster = _median(good_by_name.get(f"cluster_{size_name}", []), "elapsed_s")
+                one_vm = _median(good_by_name.get(f"one_vm_{size_name}", []), "elapsed_s")
+                mb = (input_sizes or {}).get(size_name, {}).get("mb", "–")
+                versus = f"{100 * (one_vm - cluster) / cluster:+.0f}%" if cluster and one_vm else "–"
+                lines.append(f"| {size_name} | {mb} | {'–' if cluster is None else f'{cluster:.1f}'} | "
+                             f"{'–' if one_vm is None else f'{one_vm:.1f}'} | {versus} |")
+
         lines += ["", "Where the time goes (median seconds):", "",
                   "| Variant | " + " | ".join(p.replace("_", " ") for p in PHASES) + " |",
                   "|---|" + "---|" * len(PHASES)]
-        for name in names:
-            good = [r for r in by_variant[name] if r["status"] == "SUCCESS"]
+        for variant in variants:
+            good = good_by_name[variant.name]
             if good:
-                lines.append(f"| {name} | " + " | ".join(_median_text(good, f"{p}_s") for p in PHASES) + " |")
-
-    tests = _latest(read_rows, "test")
-    if tests:
-        lines += ["", "## read", "", "| Test | Variant | Median (s) | Range (s) | Change | Verdict | Files read | "
-                  "Tasks per query | Data read (MB) | Schema inference (s) |", "|---|---|---|---|---|---|---|---|---|---|"]
-    for test in [t for t in READ_TESTS if t in tests]:
-        names = READ_TESTS[test]
-        good_rows = [r for r in tests[test] if r["status"] == "SUCCESS"]
-        reference = _floats([r for r in good_rows if r["variant"] == names[0]], "seconds")
-        for name in names:
-            group = [r for r in good_rows if r["variant"] == name]
-            if not group:
-                failed = [r for r in tests[test] if r["variant"] == name]
-                detail = f"{failed[0]['status']}: {failed[0].get('error', '')}".replace("|", "/") if failed else "not run"
-                lines.append(f"| {test} | {name} | – | – | – | {detail} |" + " – |" * 4)
-                continue
-            times = _floats(group, "seconds")
-            verdict = "reference" if name == names[0] else compare(reference, times)
-            cells = [test, name, *_time_cells(times, reference), verdict]
-            cells += [_median_text(group, c) for c in ("files_read", "tasks_per_query", "input_mb_per_query",
-                                                       "inference_s")]
-            lines.append("| " + " | ".join(cells) + " |")
+                lines.append(f"| {variant.name} | " + " | ".join(_median_text(good, f"{p}_s") for p in PHASES) + " |")
     return "\n".join(lines) + "\n"
 
 
 def write_summary(paths: Paths) -> str:
     paths.results.mkdir(parents=True, exist_ok=True)
-    text = build_summary(_read_rows(paths.results / "runs.csv"), _read_rows(paths.results / "read_runs.csv"))
+    sizes_file = paths.results / "input.json"
+    sizes = json.loads(sizes_file.read_text(encoding="utf-8")).get("inputs", {}) if sizes_file.exists() else {}
+    text = build_summary(_read_rows(paths.results / "runs.csv"), sizes)
     (paths.results / "summary.md").write_text(text, "utf-8")
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if step_summary:
@@ -901,13 +818,14 @@ def main() -> int:
 
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         spec = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-        children = {"full": _full_run_child, "prepare_read": _prepare_read_child, "read": _read_child}
-        return children[spec["kind"]](spec)
+        return _full_run_child(spec)
 
     parser = argparse.ArgumentParser(description="DAT535 Silver performance experiments",
                                      formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    parser.add_argument("batch", choices=["setup", *FULL_BATCHES, "read", "summary"])
+    parser.add_argument("batch", choices=["setup", *BATCH_NAMES, "summary"])
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS, help="measured runs per variant")
+    parser.add_argument("--size", choices=list(INPUT_DIRS), default="x1",
+                        help="input size for shuffle and read_tasks (scale runs every size)")
     parser.add_argument("--cluster", default=DEFAULT_CLUSTER_URL, help="Spark master of the cluster variants")
     parser.add_argument("--time-limit", type=float, default=RUN_TIME_LIMIT_S, help="seconds per run")
     parser.add_argument("--perf-dir", type=Path, default=DATA_ROOT / "perf", help="the experiments' folder")
@@ -923,14 +841,13 @@ def main() -> int:
         print(write_summary(paths))
         return 0
 
-    if not (paths.input / "full").is_dir():
-        print(f"No frozen input in {paths.input}: run the setup batch first.", file=sys.stderr)
+    variants = batch_variants(args.batch, args.size)
+    missing = sorted({v.input for v in variants if not paths.input_dir(v.input).is_dir()})
+    if missing:
+        print(f"No frozen input for {', '.join(missing)} in {paths.input}: run the setup batch first.", file=sys.stderr)
         return 2
     paths.results.mkdir(parents=True, exist_ok=True)
-    if args.batch == "read":
-        finished = run_read_batch(paths, args.repeats, args.cluster, args.time_limit)
-    else:
-        finished = run_full_batch(paths, args.batch, args.repeats, args.cluster, args.time_limit)
+    finished = run_full_batch(paths, args.batch, variants, args.repeats, args.cluster, args.time_limit)
     print(write_summary(paths))
     return 0 if finished else 1
 

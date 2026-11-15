@@ -1,9 +1,9 @@
 # systemd unit that keeps the cheapest hours API running on the VM (api/main.py, guide: docs/api.md).
 #
-# It runs from the same clone and Python environment as the dashboard (~/dat535-dashboard, ~/dashboard-env;
+# It runs from the same clone and Python environment as the dashboard (~/dat535-group6, ~/dashboard-env;
 # see deploy/dat535-dashboard.service), after:
-#   cd ~/dat535-dashboard && git pull
-#   source ~/dashboard-env/bin/activate && pip install -r requirements-dashboard.txt
+#   git -C ~/dat535-group6 pull
+#   ~/dashboard-env/bin/pip install -r ~/dat535-group6/requirements-dashboard.txt
 #
 # Install and start:
 #   sudo cp deploy/dat535-api.service /etc/systemd/system/
@@ -20,7 +20,7 @@ After=network.target
 
 [Service]
 User=ubuntu
-WorkingDirectory=/home/ubuntu/dat535-dashboard
+WorkingDirectory=/home/ubuntu/dat535-group6
 Environment=DAT535_ENV=prod
 Environment=DAT535_DATA_DIR=/home/ubuntu/spark-project-data
 ExecStart=/home/ubuntu/dashboard-env/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 1
