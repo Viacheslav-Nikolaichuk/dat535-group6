@@ -19,7 +19,7 @@ uvicorn api.main:app --port 8000                         # http://localhost:8000
 **On the VM**, as a service next to the dashboard. It uses the dashboard's clone and Python environment:
 
 ```bash
-cd ~/dat535-dashboard && git pull
+cd ~/dat535-group6 && git pull
 source ~/dashboard-env/bin/activate && pip install -r requirements-dashboard.txt
 sudo cp deploy/dat535-api.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now dat535-api

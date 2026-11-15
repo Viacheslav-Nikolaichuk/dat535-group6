@@ -1,9 +1,13 @@
 # systemd unit that keeps the Streamlit dashboard running on the VM (docs/plans/gold_layer.md, G6).
 #
-# The dashboard runs from its own clone of the repository, not from the Actions runner's work folder,
-# which is replaced on every workflow run:
-#   git clone <repo url> ~/dat535-dashboard && cd ~/dat535-dashboard
-#   source ~/spark-env/bin/activate && pip install -r requirements.txt -r requirements-dashboard.txt
+# The dashboard runs from its own clone of the repository, ~/dat535-group6, not from the Actions runner's
+# work folder, which is replaced on every workflow run. It has its own Python environment, ~/dashboard-env,
+# kept apart from the runner's ~/spark-env. The API (deploy/dat535-api.service) shares both:
+#   git clone <repo url> ~/dat535-group6
+#   python3 -m venv ~/dashboard-env && ~/dashboard-env/bin/pip install -r ~/dat535-group6/requirements-dashboard.txt
+#
+# Update: run the pipeline on main first, so prod Gold already has any new tables, then
+#   git -C ~/dat535-group6 pull && sudo systemctl restart dat535-dashboard dat535-api
 #
 # Install and start:
 #   sudo cp deploy/dat535-dashboard.service /etc/systemd/system/
@@ -19,10 +23,10 @@ After=network.target
 
 [Service]
 User=ubuntu
-WorkingDirectory=/home/ubuntu/dat535-dashboard
+WorkingDirectory=/home/ubuntu/dat535-group6
 Environment=DAT535_ENV=prod
 Environment=DAT535_DATA_DIR=/home/ubuntu/spark-project-data
-ExecStart=/home/ubuntu/spark-env/bin/streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false
+ExecStart=/home/ubuntu/dashboard-env/bin/streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false
 Restart=on-failure
 RestartSec=5
 

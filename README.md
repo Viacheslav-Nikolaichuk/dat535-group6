@@ -362,11 +362,12 @@ python scripts/make_sample_gold.py      # locally, without the VM: synthetic Gol
 streamlit run dashboard/app.py          # http://localhost:8501
 ```
 
-On the VM, with the real Gold of an environment (in a Python environment with `requirements-dashboard.txt`):
+By hand on the VM, e.g. to look at dev's Gold (the prod service already uses port 8501):
 
 ```bash
-DAT535_ENV=prod DAT535_DATA_DIR=~/spark-project-data \
-  streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true
+source ~/dashboard-env/bin/activate
+DAT535_ENV=dev DAT535_DATA_DIR=~/spark-project-data \
+  streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8503 --server.headless true
 ```
 
 ### Cheapest hours API
@@ -379,7 +380,11 @@ uvicorn api.main:app --port 8000          # http://localhost:8000/ lists the end
 
 ### Deployment on the VM
 
-Both run as systemd services on the VM, from their own clone of the repository (the Actions runner replaces its work folder on every run). The units are [deploy/dat535-dashboard.service](deploy/dat535-dashboard.service) and [deploy/dat535-api.service](deploy/dat535-api.service); each one's header has the install steps. They listen only on `127.0.0.1`, so nothing is public; open them from your laptop through an SSH tunnel:
+Both run as systemd services on the VM, serving prod Gold: [deploy/dat535-dashboard.service](deploy/dat535-dashboard.service) and [deploy/dat535-api.service](deploy/dat535-api.service), whose headers have the install steps.
+
+- **Their own clone and environment:** both run from the clone `~/dat535-group6` (the Actions runner replaces its work folder on every run) with the Python environment `~/dashboard-env` (`requirements-dashboard.txt`), kept apart from the runner's `~/spark-env`.
+- **Updating:** run the pipeline on `main` first, so prod Gold already has any new tables, then `git -C ~/dat535-group6 pull && sudo systemctl restart dat535-dashboard dat535-api`. New Gold data needs no restart: both read the tables again after a new Gold run.
+- **Access:** they listen only on `127.0.0.1`, so nothing is public. Open them from your laptop through an SSH tunnel:
 
 ```bash
 ssh -L 8501:localhost:8501 -L 8000:localhost:8000 ubuntu@<vm floating ip>
